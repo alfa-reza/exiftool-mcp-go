@@ -1,0 +1,1 @@
+{"$schema":"https://opencode.ai/config.json","mcp":{"exiftool":{"command":["/absolute/path/to/exiftool-mcp-go"],"enabled":true,"environment":{"EXIFTOOL_PATH":"/usr/bin/exiftool"},"type":"local"}}}
