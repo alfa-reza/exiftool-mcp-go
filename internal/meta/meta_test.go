@@ -148,6 +148,32 @@ func TestReadStderrErrorCorrelation(t *testing.T) {
 	}
 }
 
+func TestReadCorrelatesAcrossSlashStyles(t *testing.T) {
+	// On Windows, ExifTool echoes SourceFile and stderr operands with
+	// forward slashes while callers pass backslash paths. Correlation
+	// must not depend on the slash style, or every read on Windows is
+	// misreported as "no output from exiftool for this file".
+	fr := &fakeRunner{
+		stdout: []byte(`[{"SourceFile":"C:/x/bad.jpg"},{"SourceFile":"C:/x/good.jpg","EXIF:IFD0:Make":"Canon"}]`),
+		stderr: "Error: File format error - C:/x/bad.jpg\n",
+	}
+	r := &Reader{Runner: fr}
+	results, err := r.Read(context.Background(), []string{`C:\x\bad.jpg`, `C:\x\good.jpg`},
+		ReadSpec{IncludeTags: []string{"Make"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].Status != "error" || results[0].Error != "File format error" {
+		t.Fatalf("bad file not correlated across slash styles: %+v", results[0])
+	}
+	if results[1].Status != "ok" || len(results[1].Entries) != 1 {
+		t.Fatalf("good file not correlated across slash styles: %+v", results[1])
+	}
+}
+
 func TestEnumeratePolicy(t *testing.T) {
 	root := t.TempDir()
 	sub := filepath.Join(root, "sub")

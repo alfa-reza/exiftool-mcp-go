@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,9 @@ func buildServer(t *testing.T) string {
 	}
 	root := filepath.Join(wd, "..", "..")
 	bin := filepath.Join(t.TempDir(), "exiftool-mcp-go")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-o", bin, "./cmd/exiftool-mcp-go")
 	cmd.Dir = root
 	if out, err := cmd.CombinedOutput(); err != nil {
