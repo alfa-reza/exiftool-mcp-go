@@ -1149,3 +1149,38 @@ func TestSearchEnumerationErrorKeepsStatusPartial(t *testing.T) {
 		t.Fatalf("enumeration error not reported: %+v", out.Errors)
 	}
 }
+
+func TestReadOversizedValueStoreFailureIsLoud(t *testing.T) {
+	// A value too large to inline is externalized to the store.
+	// When that store write fails (here: a quota smaller than the
+	// value), the read must fail loudly — leaving the value inline
+	// would silently blow the response byte budget.
+	requireExifTool(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big.jpg")
+	writeJPEG(t, p)
+	cli(t, "-q", "-overwrite_original", "-Comment="+strings.Repeat("x", 40000), p)
+	storeDir := t.TempDir()
+	cfg := config.Config{
+		StoreDir: storeDir, CallTimeout: 60 * time.Second, MaxConcurrency: 4,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 2048,
+		ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	st, err := store.New(storeDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rn := runner.New(cfg)
+	app := &App{Cfg: cfg, Runner: rn, Reader: &meta.Reader{Runner: rn}, Store: st}
+	_, out, err := app.readMetadata(context.Background(), nil, ReadMetadataIn{
+		Paths:          []string{p},
+		MetadataFilter: &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "RESULT_STORE_FULL" {
+		t.Fatalf("oversized value with a full store must fail as RESULT_STORE_FULL, got %+v", out)
+	}
+}

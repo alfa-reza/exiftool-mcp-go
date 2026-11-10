@@ -116,7 +116,10 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 				}
 				m, err := a.Store.SaveText(text)
 				if err != nil {
-					continue // leave value inline rather than dropping it
+					// Never leave the oversized value inline: the
+					// response would silently exceed its byte
+					// budget. Failing loudly beats a wrong reply.
+					return failWith(storeErrorCode(err), err.Error())
 				}
 				e.ValueRef = &meta.ValueRef{ResultID: m.ID, Kind: string(store.KindText), Size: int64(len(text))}
 				e.Value = nil

@@ -105,8 +105,12 @@ func (a *App) discoverTags(ctx context.Context, _ *mcp.CallToolRequest, in Disco
 			files[i] = c.Path
 		}
 		counts := make(map[string]*TagInfo)
-		if len(files) > 0 {
-			results, err := a.Reader.Read(ctx, files, meta.ReadSpec{})
+		// Aggregate chunk by chunk: memory stays bounded by one
+		// chunk of reads plus the tag table, never by the whole
+		// collection's metadata at once.
+		for start := 0; start < len(files); start += readChunkFiles {
+			chunk := files[start:min(start+readChunkFiles, len(files))]
+			results, err := a.Reader.Read(ctx, chunk, meta.ReadSpec{})
 			if err != nil {
 				return fail(errorCode(err), err.Error())
 			}
