@@ -2,10 +2,12 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -419,5 +421,43 @@ func TestFragmentAtEOFCompletesRune(t *testing.T) {
 	}
 	if !utf8.Valid(chunk) {
 		t.Fatal("fragment is not valid UTF-8")
+	}
+}
+
+func TestScanLockReleaseRespectsOwnership(t *testing.T) {
+	s := newStore(t)
+	job := &ScanJob{ResultID: strings.Repeat("a", 32)}
+	if err := s.CreateScan(job); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	relA, err := s.LockScan(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(s.dir, "scans", job.ID, "job.lock")
+	// A's heartbeat stops (crash): the lock goes stale, B takes over.
+	old := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(lockPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	relB, err := s.LockScan(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	// A finally releases: it must NOT delete B's lock.
+	relA()
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("stale owner's release deleted the successor's lock: %v", err)
+	}
+	// B still holds it: a third acquisition cannot proceed.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := s.LockScan(cctx, job.ID); err == nil {
+		t.Fatal("third acquisition should fail while B holds the lock")
+	}
+	relB()
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock file should be gone after the owner releases (stat err = %v)", err)
 	}
 }

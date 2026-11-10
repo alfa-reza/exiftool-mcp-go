@@ -682,15 +682,28 @@ const (
 	lockStaleAfter = 45 * time.Second
 )
 
+// readLockToken returns the ownership token stored in a scan lock
+// file, or "" when it cannot be read.
+func readLockToken(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // LockScan acquires the cross-process lock for one scan and returns
 // its release function. The mutex in the tools layer serializes
 // batches inside one server process; this lock extends the same
 // guarantee to two server processes sharing one store directory —
 // without it, both could run the same batch and duplicate records.
 // The lock is a file created exclusively inside the scan's
-// directory; a heartbeat keeps its mtime fresh while held, and a
-// lock whose heartbeat has stopped is taken over. Waiting honors
-// ctx cancellation.
+// directory, containing a unique ownership token; a heartbeat keeps
+// its mtime fresh while held, and a lock whose heartbeat has
+// stopped is taken over. The heartbeat and the release verify the
+// token before touching the file: after a takeover the file belongs
+// to the successor, and the stale owner must neither refresh nor
+// delete it. Waiting honors ctx cancellation.
 func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
 	if !validID(id) {
 		return nil, ErrNotFound
@@ -700,10 +713,11 @@ func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
 		return nil, ErrNotFound
 	}
 	path := filepath.Join(dir, "job.lock")
+	token := fmt.Sprintf("%d-%s", os.Getpid(), newID())
 	for {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			fmt.Fprintf(f, "%d %s", os.Getpid(), s.now().Format(time.RFC3339))
+			_, _ = f.WriteString(token)
 			_ = f.Close()
 			stop := make(chan struct{})
 			go func() {
@@ -714,6 +728,9 @@ func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
 					case <-stop:
 						return
 					case <-tick.C:
+						if readLockToken(path) != token {
+							return // taken over; stop refreshing
+						}
 						now := s.now()
 						_ = os.Chtimes(path, now, now)
 					}
@@ -723,7 +740,9 @@ func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
 			return func() {
 				once.Do(func() {
 					close(stop)
-					_ = os.Remove(path)
+					if readLockToken(path) == token {
+						_ = os.Remove(path)
+					}
 				})
 			}, nil
 		}
