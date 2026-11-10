@@ -386,3 +386,22 @@ func TestValidateSelectorRejectsWriteOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestReaderStderrCorrelationWithDashPath(t *testing.T) {
+	// A file name containing " - " must not break stderr error
+	// correlation: splitting the diagnostic line at its last " - "
+	// used to truncate the operand to "edited.jpg" and silently
+	// drop the error, leaving the file "ok".
+	f := "/tmp/photos/photo - edited.jpg"
+	r := &Reader{Runner: &fakeRunner{
+		stdout: []byte(`[{"SourceFile":"` + f + `"}]`),
+		stderr: "Error: File format error - " + f + "\n",
+	}}
+	res, err := r.Read(context.Background(), []string{f}, ReadSpec{IncludeTags: []string{"Make"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Status != "error" || res[0].Error != "File format error" {
+		t.Fatalf("dash-path error not correlated: %+v", res)
+	}
+}

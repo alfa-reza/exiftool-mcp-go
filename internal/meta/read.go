@@ -124,6 +124,20 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 	}
 	type diag struct{ errors, warnings []string }
 	byOperand := make(map[string]*diag)
+	// The operands as ExifTool echoes them, per requested file. A
+	// diagnostic line ends with " - <operand>"; the operand must be
+	// matched against the files actually sent, never found by
+	// splitting the line at its last " - ": a file NAME may itself
+	// contain " - " ("photo - edited.jpg"), which used to truncate
+	// the operand to "edited.jpg" and silently drop the error.
+	type operand struct{ file, text string }
+	var operands []operand
+	for _, f := range files {
+		if op, err := runner.Operand(f); err == nil {
+			operands = append(operands, operand{f, op})
+		}
+		operands = append(operands, operand{f, f})
+	}
 	for _, line := range strings.Split(stderr, "\n") {
 		// Windows child output ends lines with CRLF; a trailing \r
 		// would poison the operand comparison.
@@ -137,30 +151,29 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 		default:
 			continue
 		}
-		idx := strings.LastIndex(rest, " - ")
-		if idx < 0 {
+		// The LONGEST matching operand suffix wins, so a real path
+		// beats a shorter coincidental suffix of it.
+		best, bestLen := -1, -1
+		restKey := pathKey(rest)
+		for i, o := range operands {
+			if suffix := " - " + pathKey(o.text); strings.HasSuffix(restKey, suffix) && len(suffix) > bestLen {
+				best, bestLen = i, len(suffix)
+			}
+		}
+		if best < 0 {
 			continue
 		}
-		msg, tail := rest[:idx], rest[idx+3:]
-		for _, f := range files {
-			op, err := runner.Operand(f)
-			if err != nil {
-				continue
-			}
-			if tail != op && tail != f && pathKey(tail) != pathKey(op) && pathKey(tail) != pathKey(f) {
-				continue
-			}
-			d := byOperand[f]
-			if d == nil {
-				d = &diag{}
-				byOperand[f] = d
-			}
-			if kind == "error" {
-				d.errors = append(d.errors, msg)
-			} else {
-				d.warnings = append(d.warnings, msg)
-			}
-			break
+		msg := rest[:len(rest)-bestLen]
+		f := operands[best].file
+		d := byOperand[f]
+		if d == nil {
+			d = &diag{}
+			byOperand[f] = d
+		}
+		if kind == "error" {
+			d.errors = append(d.errors, msg)
+		} else {
+			d.warnings = append(d.warnings, msg)
 		}
 	}
 	for i := range out {
