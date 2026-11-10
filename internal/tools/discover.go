@@ -14,11 +14,13 @@ import (
 // groupSegmentMatch reports whether sel names the full group or any
 // family segment of it.
 func groupSegmentMatch(group, sel string) bool {
-	if group == sel {
+	// Group matching is case-insensitive, like everywhere else in
+	// the query surface: "exif" selects the EXIF group.
+	if strings.EqualFold(group, sel) {
 		return true
 	}
 	for _, seg := range strings.Split(group, ":") {
-		if seg == sel {
+		if strings.EqualFold(seg, sel) {
 			return true
 		}
 	}

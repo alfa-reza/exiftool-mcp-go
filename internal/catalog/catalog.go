@@ -7,11 +7,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"fmt"
+	"io"
 	"sort"
 	"strings"
 
 	"github.com/alfa-reza/exiftool-mcp-go/internal/runner"
 )
+
+// tableName returns the name attribute of a table start element
+// for error messages.
+func tableName(start xml.StartElement) string {
+	for _, a := range start.Attr {
+		if a.Name.Local == "name" {
+			return a.Value
+		}
+	}
+	return ""
+}
 
 // TagDef is one catalog tag definition from -listx.
 type TagDef struct {
@@ -31,7 +44,9 @@ type Catalog struct {
 	Supported []string // extensions from -listf
 }
 
-// Load fetches and parses all listings through the runner.
+// Load fetches and parses all listings through the runner. Every
+// listing is required: a failed -listg/-listr/-listf used to be
+// silently ignored, leaving the catalog quietly incomplete.
 func Load(ctx context.Context, r runner.Runner) (*Catalog, error) {
 	c := &Catalog{}
 	out, err := runText(ctx, r, "-listx")
@@ -43,13 +58,19 @@ func Load(ctx context.Context, r runner.Runner) (*Catalog, error) {
 		return nil, err
 	}
 	c.Tags = tags
-	if out, err := runText(ctx, r, "-listg"); err == nil {
+	if out, err := runText(ctx, r, "-listg"); err != nil {
+		return nil, err
+	} else {
 		c.Groups = ParseGroups(out)
 	}
-	if out, err := runText(ctx, r, "-listr"); err == nil {
+	if out, err := runText(ctx, r, "-listr"); err != nil {
+		return nil, err
+	} else {
 		c.Readable = ParseExtensions(out)
 	}
-	if out, err := runText(ctx, r, "-listf"); err == nil {
+	if out, err := runText(ctx, r, "-listf"); err != nil {
+		return nil, err
+	} else {
 		c.Supported = ParseExtensions(out)
 	}
 	return c, nil
@@ -138,13 +159,24 @@ type xmlTag struct {
 }
 
 // ParseListX parses the -listx XML stream into tag definitions.
+// The stream must be COMPLETE: a truncated document (the decoder
+// hits EOF before the closing </taginfo>, or a syntax error) and a
+// malformed table are errors, not a silently partial catalog.
 func ParseListX(data []byte) ([]TagDef, error) {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	var out []TagDef
+	sawRootEnd := false
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			break // EOF or trailing junk: keep what we have
+			if err == io.EOF && sawRootEnd {
+				break
+			}
+			return nil, fmt.Errorf("parsing -listx output: %w", err)
+		}
+		if end, ok := tok.(xml.EndElement); ok && end.Name.Local == "taginfo" {
+			sawRootEnd = true
+			continue
 		}
 		start, ok := tok.(xml.StartElement)
 		if !ok || start.Name.Local != "table" {
@@ -152,7 +184,7 @@ func ParseListX(data []byte) ([]TagDef, error) {
 		}
 		var table xmlTagTable
 		if err := dec.DecodeElement(&table, &start); err != nil {
-			continue
+			return nil, fmt.Errorf("parsing -listx table %q: %w", tableName(start), err)
 		}
 		group := table.G0
 		for _, t := range table.Tags {

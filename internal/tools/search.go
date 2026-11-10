@@ -468,7 +468,7 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	out.MatchedCount = job.Matched
 	out.NoMatchCount = job.NoMatch
 	out.IndeterminateCount = job.Indet
-	out.ErrorCount = job.Errors
+	out.ErrorCount = job.Errors + job.EnumErrors
 	out.ScannedCount = job.Processed
 	out.TotalCandidates = len(job.Candidates)
 	out.ScanComplete = job.Done

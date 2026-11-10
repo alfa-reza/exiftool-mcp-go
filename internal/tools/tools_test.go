@@ -1414,3 +1414,45 @@ func TestSearchExternalizesOversizedValues(t *testing.T) {
 		t.Fatalf("stored fragment should hold the value, got %d bytes", len(chunk))
 	}
 }
+
+func TestDiscoverGroupFilterCaseInsensitive(t *testing.T) {
+	// The group filter matches case-insensitively: "exif" selects
+	// tags in the EXIF group.
+	requireExifTool(t)
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	_, out, err := app.discoverTags(context.Background(), nil, DiscoverTagsIn{
+		Scope: "present_in_files", Query: "Make", Paths: []string{dir}, Group: "exif",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, it := range out.Items {
+		if it.Name == "Make" && it.Group != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("group filter \"exif\" matched nothing: %+v", out.Items)
+	}
+}
+
+func TestSearchErrorCountIncludesEnumErrors(t *testing.T) {
+	// Enumeration failures are errors of the scan and must be
+	// included in error_count, not just listed.
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir, filepath.Join(dir, "does-not-exist.jpg")}, Query: q,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// setupPhotos' corrupt.jpg fails extraction (1) and the missing
+	// path fails enumeration (1): error_count must report both.
+	if out.ErrorCount != 2 {
+		t.Fatalf("error_count = %d, want 2 (extraction + enumeration): %+v", out.ErrorCount, out)
+	}
+}
