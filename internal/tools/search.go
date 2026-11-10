@@ -296,6 +296,19 @@ func (a *App) readFilesIndividually(ctx context.Context, files []string, spec me
 	return out, nil
 }
 
+// externalizeValues moves oversized values in scan record entries
+// into the store as text fragments (the same treatment read_metadata
+// gives them), so a search response never carries a huge value
+// inline either.
+func (a *App) externalizeValues(entries []meta.Entry) ([]meta.Entry, error) {
+	for i := range entries {
+		if _, err := a.externalizeEntryValue(&entries[i]); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
 // runSearchBatch evaluates one bounded batch of the scan and commits it.
 func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *store.ScanJob, prepared *query.Prepared, spec meta.ReadSpec, out SearchMetadataOut) (*mcp.CallToolResult, SearchMetadataOut, error) {
 	fail := func(code, msg string) (*mcp.CallToolResult, SearchMetadataOut, error) {
@@ -402,17 +415,25 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 			switch tri {
 			case query.Match:
 				job.Matched++
+				vals, verr := a.externalizeValues(filterEntries(fr.Entries, job.ReturnTags))
+				if verr != nil {
+					return fail(storeErrorCode(verr), verr.Error())
+				}
 				callRecords = append(callRecords, ScanRecord{
 					Path: fr.Path, Status: "match",
-					Values:                filterEntries(fr.Entries, job.ReturnTags),
+					Values:                vals,
 					ChangedSinceDiscovery: changed[i],
 					Index:                 batchStart + i,
 				})
 			case query.Indeterminate:
 				job.Indet++
+				vals, verr := a.externalizeValues(filterEntries(fr.Entries, job.ReturnTags))
+				if verr != nil {
+					return fail(storeErrorCode(verr), verr.Error())
+				}
 				callRecords = append(callRecords, ScanRecord{
 					Path: fr.Path, Status: "indeterminate", Reason: reason,
-					Values:                filterEntries(fr.Entries, job.ReturnTags),
+					Values:                vals,
 					ChangedSinceDiscovery: changed[i],
 					Index:                 batchStart + i,
 				})

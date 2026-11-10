@@ -48,6 +48,29 @@ type ReadMetadataOut struct {
 // text fragments instead of inlining them into the response.
 const largeValueThreshold = 32 << 10
 
+// externalizeEntryValue moves an oversized entry value into the
+// store as a text fragment and replaces it with a value_ref, so a
+// response never carries a huge value inline. It reports whether
+// the value was externalized.
+func (a *App) externalizeEntryValue(e *meta.Entry) (bool, error) {
+	raw, err := json.Marshal(e.Value)
+	if err != nil || len(raw) <= largeValueThreshold {
+		return false, nil
+	}
+	text := string(raw)
+	if s, ok := e.Value.(string); ok {
+		text = s
+	}
+	m, err := a.Store.SaveText(text)
+	if err != nil {
+		return false, err
+	}
+	e.ValueRef = &meta.ValueRef{ResultID: m.ID, Kind: string(store.KindText), Size: int64(len(text))}
+	e.Value = nil
+	e.ValueOmitted = true
+	return true, nil
+}
+
 // readChunkFiles bounds how many files one streaming step of
 // read_metadata processes (the reader itself invokes ExifTool in
 // smaller chunks).
@@ -105,25 +128,12 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 		// Move oversized values into the store as text fragments.
 		for i := range results {
 			for j := range results[i].Entries {
-				e := &results[i].Entries[j]
-				raw, err := json.Marshal(e.Value)
-				if err != nil || len(raw) <= largeValueThreshold {
-					continue
-				}
-				text := string(raw)
-				if s, ok := e.Value.(string); ok {
-					text = s
-				}
-				m, err := a.Store.SaveText(text)
-				if err != nil {
+				if _, err := a.externalizeEntryValue(&results[i].Entries[j]); err != nil {
 					// Never leave the oversized value inline: the
 					// response would silently exceed its byte
 					// budget. Failing loudly beats a wrong reply.
 					return failWith(storeErrorCode(err), err.Error())
 				}
-				e.ValueRef = &meta.ValueRef{ResultID: m.ID, Kind: string(store.KindText), Size: int64(len(text))}
-				e.Value = nil
-				e.ValueOmitted = true
 			}
 		}
 		processed += len(results)

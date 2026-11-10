@@ -1274,3 +1274,143 @@ func TestReaderCombinedGroupFamiliesRealExifTool(t *testing.T) {
 		}
 	}
 }
+
+// slowRunner: multi-file reads stall forever; single-file reads
+// take 300 ms each and then answer.
+type slowRunner struct{}
+
+func (slowRunner) Path() string       { return "slow" }
+func (slowRunner) ConfigMode() string { return "standard" }
+
+func (slowRunner) Run(ctx context.Context, args ...string) (runner.Result, error) {
+	var files []string
+	for _, a := range args {
+		if strings.HasSuffix(a, ".jpg") {
+			files = append(files, a)
+		}
+	}
+	if len(files) != 1 {
+		<-ctx.Done()
+		return runner.Result{}, ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return runner.Result{}, ctx.Err()
+	case <-time.After(300 * time.Millisecond):
+	}
+	f := files[0]
+	make_ := "Canon"
+	if strings.Contains(f, "b.jpg") {
+		make_ = "Nikon"
+	}
+	payload, _ := json.Marshal([]map[string]string{{"SourceFile": f, "EXIF:IFD0:Make": make_}})
+	return runner.Result{Stdout: payload}, nil
+}
+
+func TestSearchWorkDeadlineBoundsWholeCall(t *testing.T) {
+	// max_seconds bounds the WHOLE call — batch attempt and
+	// per-file fallback share one deadline. A call over slow files
+	// returns within budget, commits exactly the prefix it
+	// finished, and leaves the tail for the next call.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	cfg := config.Config{
+		StoreDir: storeDir, CallTimeout: 5 * time.Second, MaxConcurrency: 4,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 1 << 30,
+		ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	st, err := store.New(storeDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := slowRunner{}
+	app := &App{Cfg: cfg, Runner: sr, Reader: &meta.Reader{Runner: sr}, Store: st}
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	start := time.Now()
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 4, MaxSeconds: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("call outlived its work deadline: %v", elapsed)
+	}
+	if out.ScanComplete {
+		t.Fatalf("slow files cannot all finish within 1s: %+v", out)
+	}
+	if out.ScannedCount == 0 || out.ScannedCount >= 4 || out.ResumeToken == "" {
+		t.Fatalf("expected a committed prefix with a resume token: %+v", out)
+	}
+	token := out.ResumeToken
+	var final SearchMetadataOut
+	for i := 0; i < 5; i++ {
+		_, o, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+			ResumeToken: token, ScanOptions: &ScanOptionsInput{MaxSeconds: 2},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		final = o
+		if o.ScanComplete {
+			break
+		}
+	}
+	if !final.ScanComplete || final.ScannedCount != 4 {
+		t.Fatalf("resumes should complete the scan exactly once per file: %+v", final)
+	}
+	job, err := app.Store.LoadScan(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Matched+job.NoMatch+job.Indet+job.Errors != 4 {
+		t.Fatalf("every candidate must be accounted exactly once: %+v", job)
+	}
+	m, err := app.Store.LoadMeta(job.ResultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.TotalRecords != job.Matched+job.Indet {
+		t.Fatalf("stored records %d != matched+indeterminate %d (duplicates?)", m.TotalRecords, job.Matched+job.Indet)
+	}
+}
+
+func TestSearchExternalizesOversizedValues(t *testing.T) {
+	// A matched record's oversized return value must be stored as
+	// a text fragment with a value_ref — the same treatment
+	// read_metadata gives it — never shipped inline.
+	requireExifTool(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big.jpg")
+	writeJPEG(t, p)
+	valueFile := filepath.Join(dir, "comment.txt")
+	if err := os.WriteFile(valueFile, []byte(strings.Repeat("x", 40000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli(t, "-q", "-overwrite_original", "-Comment<="+valueFile, p)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "predicate", Tag: "Comment", Operator: "exists"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{p}, Query: q, ReturnTags: []string{"Comment"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.MatchedCount != 1 || len(out.Items) != 1 || len(out.Items[0].Values) != 1 {
+		t.Fatalf("expected one matched record with one value: %+v", out)
+	}
+	v := out.Items[0].Values[0]
+	if v.ValueRef == nil || v.Value != nil {
+		t.Fatalf("oversized value was not externalized: value=%v ref=%v", v.Value != nil, v.ValueRef)
+	}
+	_, chunk, _, err := app.Store.Fragment(v.ValueRef.ResultID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunk) != 100 {
+		t.Fatalf("stored fragment should hold the value, got %d bytes", len(chunk))
+	}
+}
