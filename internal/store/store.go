@@ -15,6 +15,8 @@
 package store
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -80,18 +82,25 @@ type ScanJob struct {
 	// TimeContext is the timezone assumption the scan was started
 	// with. A resume must reuse it: accepting a different (or no)
 	// assumption on resume would silently change verdicts mid-scan.
-	TimeContext string           `json:"time_context,omitempty"`
-	CreatedAt   time.Time        `json:"created_at"`
-	ExpiresAt   time.Time        `json:"expires_at"`
-	Candidates  []meta.Candidate `json:"candidates"`
-	NextIndex   int              `json:"next_index"`
+	TimeContext string `json:"time_context,omitempty"`
+	// HasTimeContext records whether a time_context was supplied at
+	// all when the scan started, so a resume cannot ADD one to a
+	// scan that began without it. (Checkpoints written before this
+	// field existed are recognized by TimeContext != "".)
+	HasTimeContext bool             `json:"has_time_context,omitempty"`
+	CreatedAt      time.Time        `json:"created_at"`
+	ExpiresAt      time.Time        `json:"expires_at"`
+	Candidates     []meta.Candidate `json:"candidates"`
+	NextIndex      int              `json:"next_index"`
 	// CommittedRecords is the number of result records written by
 	// committed batches. On resume it is reconciled with the result
 	// store. Records ahead of the checkpoint mean a crash between
-	// appending a batch and saving the checkpoint; that state is
-	// recoverable from the records themselves (each carries its
-	// candidate index) and is rebuilt, never silently duplicated.
-	// Fewer records than the checkpoint claims is genuine corruption.
+	// appending a batch and saving the checkpoint; those records
+	// are rolled back and the batch is reprocessed, because the
+	// batch's other outcomes (no-matches, per-file errors) were
+	// never persisted and adopting the records would corrupt the
+	// counts. Fewer records than the checkpoint claims is genuine
+	// corruption.
 	CommittedRecords int  `json:"committed_records"`
 	Processed        int  `json:"processed"`
 	Matched          int  `json:"matched"`
@@ -310,6 +319,77 @@ func (s *Store) AppendRecords(id string, records []json.RawMessage) (*ResultMeta
 		return nil, err
 	}
 	return m, nil
+}
+
+// TruncateRecords drops every record after the first keep ones. It
+// is the rollback half of the scan commit protocol: records that a
+// crashed batch appended but its checkpoint never counted are
+// removed so the batch can be reprocessed cleanly, with its
+// no-matches and per-file errors re-derived instead of guessed.
+// The surviving records are rewritten into a single fresh segment
+// and the meta is switched to it before the old segments are
+// deleted, so a crash mid-truncate leaves orphan files, never a
+// dangling reference.
+func (s *Store) TruncateRecords(id string, keep int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.LoadMeta(id)
+	if err != nil {
+		return err
+	}
+	if m.Kind != KindRecords {
+		return fmt.Errorf("%w: result %s holds %s, not records", ErrCorrupt, id, m.Kind)
+	}
+	if keep < 0 || keep > m.TotalRecords {
+		return fmt.Errorf("%w: cannot truncate %d records to %d", ErrCorrupt, m.TotalRecords, keep)
+	}
+	if keep == m.TotalRecords {
+		return nil
+	}
+	var lines []string
+	remaining := keep
+	for _, seg := range m.Segments {
+		if remaining == 0 {
+			break
+		}
+		data, err := os.ReadFile(filepath.Join(s.resultDir(id), seg.File))
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrCorrupt, err)
+		}
+		segLines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+		if len(segLines) != seg.Records {
+			return fmt.Errorf("%w: segment %s record count mismatch", ErrCorrupt, seg.File)
+		}
+		take := min(remaining, len(segLines))
+		lines = append(lines, segLines[:take]...)
+		remaining -= take
+	}
+	old := m.Segments
+	m.Segments = nil
+	m.TotalBytes = 0
+	if keep > 0 {
+		var buf bytes.Buffer
+		for _, line := range lines {
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+		}
+		name := "seg-trunc.jsonl"
+		if err := writeAtomic(filepath.Join(s.resultDir(id), name), buf.Bytes()); err != nil {
+			return err
+		}
+		m.Segments = []Segment{{File: name, Records: keep, Bytes: int64(buf.Len())}}
+		m.TotalBytes = int64(buf.Len())
+	}
+	m.TotalRecords = keep
+	if err := s.saveMeta(m); err != nil {
+		return err
+	}
+	for _, seg := range old {
+		if len(m.Segments) == 0 || seg.File != m.Segments[0].File {
+			_ = os.Remove(filepath.Join(s.resultDir(id), seg.File))
+		}
+	}
+	return nil
 }
 
 // MarkComplete flags a result as fully written.
@@ -587,6 +667,74 @@ func (s *Store) LoadScan(id string) (*ScanJob, error) {
 		return nil, ErrExpired
 	}
 	return &job, nil
+}
+
+const (
+	// lockHeartbeat refreshes a held scan lock's mtime; lockStaleAfter
+	// is how long a heartbeat may be silent before the holder is
+	// considered crashed and the lock is taken over.
+	lockHeartbeat  = 10 * time.Second
+	lockStaleAfter = 45 * time.Second
+)
+
+// LockScan acquires the cross-process lock for one scan and returns
+// its release function. The mutex in the tools layer serializes
+// batches inside one server process; this lock extends the same
+// guarantee to two server processes sharing one store directory —
+// without it, both could run the same batch and duplicate records.
+// The lock is a file created exclusively inside the scan's
+// directory; a heartbeat keeps its mtime fresh while held, and a
+// lock whose heartbeat has stopped is taken over. Waiting honors
+// ctx cancellation.
+func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
+	if !validID(id) {
+		return nil, ErrNotFound
+	}
+	dir := filepath.Join(s.dir, "scans", id)
+	if _, err := os.Stat(dir); err != nil {
+		return nil, ErrNotFound
+	}
+	path := filepath.Join(dir, "job.lock")
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "%d %s", os.Getpid(), s.now().Format(time.RFC3339))
+			_ = f.Close()
+			stop := make(chan struct{})
+			go func() {
+				tick := time.NewTicker(lockHeartbeat)
+				defer tick.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+						now := s.now()
+						_ = os.Chtimes(path, now, now)
+					}
+				}
+			}()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					close(stop)
+					_ = os.Remove(path)
+				})
+			}, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if fi, err := os.Stat(path); err == nil && s.now().Sub(fi.ModTime()) > lockStaleAfter {
+			_ = os.Remove(path)
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // Cleanup removes expired results and scans, then enforces the disk
