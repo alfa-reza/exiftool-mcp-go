@@ -298,6 +298,96 @@ func TestSearchResumeRestartFrozen(t *testing.T) {
 	}
 }
 
+func TestSearchResumeKeepsTimeContext(t *testing.T) {
+	// Two files with a naive DateTimeOriginal of 10:00. The query asks
+	// "after 04:00Z". Under the scan's +07:00 assumption the naive time
+	// is 03:00Z (no_match); without any assumption the comparison is
+	// mixed-timezone and indeterminate. The first batch runs with the
+	// time context; the resume (after a simulated restart) sends none
+	// and must reuse the stored one, or the second file's verdict
+	// silently changes mid-scan.
+	requireExifTool(t)
+	dir := t.TempDir()
+	for _, name := range []string{"a.jpg", "b.jpg"} {
+		p := filepath.Join(dir, name)
+		writeJPEG(t, p)
+		cli(t, "-q", "-overwrite_original", "-EXIF:DateTimeOriginal=2023:05:01 10:00:00", p)
+	}
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "DateTimeOriginal", Operator: "after",
+		Value: "2023-05-01T04:00:00Z", ValueType: "datetime"}
+
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir},
+		Query:       q,
+		TimeContext: &query.TimeContext{Timezone: "+07:00"},
+		ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out1.ScanComplete || out1.NoMatchCount != 1 || out1.IndeterminateCount != 0 {
+		t.Fatalf("first batch wrong: %+v", out1)
+	}
+	app2, _ := newTestApp(t, storeDir)
+	_, out2, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{ResumeToken: out1.ResumeToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out2.ScanComplete || out2.NoMatchCount != 2 || out2.IndeterminateCount != 0 {
+		t.Fatalf("resume lost the stored time_context: %+v", out2)
+	}
+}
+
+func TestReadDuplicatesPreserved(t *testing.T) {
+	// A JPEG with two COM segments holds two File:Comment tags in the
+	// same group. A duplicates read must return both, distinguished by
+	// their copy identity; ExifTool drops the second without -G4.
+	requireExifTool(t)
+	data := jpegBytes(t)
+	com := func(s string) []byte {
+		seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+		return append(seg, s...)
+	}
+	dup := append([]byte{}, data[:2]...)
+	dup = append(dup, com("first comment")...)
+	dup = append(dup, com("second comment")...)
+	dup = append(dup, data[2:]...)
+	path := filepath.Join(t.TempDir(), "dup.jpg")
+	if err := os.WriteFile(path, dup, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	_, out, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:          []string{path},
+		MetadataFilter: &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+		ReadOptions:    &ReadOptionsInput{IncludeDuplicates: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Items) != 1 || out.Items[0].Status != "ok" {
+		t.Fatalf("read failed: %+v", out)
+	}
+	var values []string
+	var copies []string
+	for _, e := range out.Items[0].Entries {
+		if s, ok := e.Value.(string); ok {
+			values = append(values, s)
+			copies = append(copies, e.Copy)
+		}
+	}
+	if len(values) != 2 || values[0] != "first comment" || values[1] != "second comment" {
+		t.Fatalf("duplicates not preserved: %v", values)
+	}
+	if copies[0] != "" || copies[1] != "Copy1" {
+		t.Fatalf("copy identity wrong: %v", copies)
+	}
+}
+
 func TestSearchChangedAndIndeterminate(t *testing.T) {
 	requireExifTool(t)
 	dir := t.TempDir()

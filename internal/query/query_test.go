@@ -157,6 +157,26 @@ func TestDatetimeSemantics(t *testing.T) {
 	}
 }
 
+func TestDatetimeInclusiveBounds(t *testing.T) {
+	// gte/lte must accept a value exactly equal to the bound; gt/lt
+	// must not.
+	es := entries("EXIF:DateTimeOriginal", "2023:05:01 10:00:00")
+	bound := "2023:05:01 10:00:00"
+	for _, tc := range []struct {
+		op   string
+		want Tri
+	}{
+		{"gte", Match}, {"lte", Match}, {"gt", NoMatch}, {"lt", NoMatch},
+		{"before", NoMatch}, {"after", NoMatch},
+	} {
+		n := pred("DateTimeOriginal", tc.op, bound)
+		n.ValueType = "datetime"
+		if got := eval(t, n, nil, es); got != tc.want {
+			t.Fatalf("%s with equal bound: got %v, want %v", tc.op, got, tc.want)
+		}
+	}
+}
+
 func TestSameDocument(t *testing.T) {
 	// GPS position and timestamp in DIFFERENT embedded documents must
 	// not satisfy a same_document group; in the same document they must.
@@ -177,6 +197,16 @@ func TestSameDocument(t *testing.T) {
 	)
 	if got := eval(t, group, nil, es2); got != Match {
 		t.Fatalf("same-document conditions should match: %v", got)
+	}
+	// Without any document identity, the same conditions pooled
+	// together would match, but provenance is unproven: the verdict
+	// must be indeterminate, never a match.
+	es3 := entries(
+		"GPS:GPSLatitude", float64(6.2),
+		"EXIF:DateTimeOriginal", "2023:05:01 10:00:00",
+	)
+	if got := eval(t, group, nil, es3); got != Indeterminate {
+		t.Fatalf("same_document without provenance must be indeterminate: %v", got)
 	}
 }
 

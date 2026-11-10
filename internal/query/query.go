@@ -302,13 +302,24 @@ func (p *Prepared) evalNode(n *pnode, entries []meta.Entry) (Tri, string) {
 
 // evalSameDocument evaluates a logic node once per document bucket and
 // matches if any single document satisfies the whole group.
+//
+// A match requires provenance: entries are only grouped when ExifTool
+// gave them a document (or instance) identity. Entries without any
+// identity cannot be proven to share a document, so if pooling them
+// would satisfy the group the verdict is indeterminate — never a
+// fabricated match.
 func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string) {
 	buckets := make(map[string][]meta.Entry)
 	var order []string
+	var unknown []meta.Entry
 	for _, e := range entries {
 		k := e.Document
 		if k == "" {
 			k = e.Instance
+		}
+		if k == "" {
+			unknown = append(unknown, e)
+			continue
 		}
 		if _, ok := buckets[k]; !ok {
 			order = append(order, k)
@@ -327,6 +338,23 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 		if t == Indeterminate {
 			sawIndet = true
 			reason = r
+		}
+	}
+	if len(unknown) > 0 {
+		// Pooling is the most permissive grouping of the unprovenanced
+		// entries: if even pooled they cannot satisfy the group, no
+		// same-document grouping of them could either (definite
+		// no-match). If pooled they would match, the truth depends on
+		// provenance ExifTool did not provide.
+		t, r := p.evalNode(&inner, unknown)
+		if t == Match {
+			return Indeterminate, "same_document cannot be proven: entries have no document identity"
+		}
+		if t == Indeterminate {
+			sawIndet = true
+			if reason == "" {
+				reason = r
+			}
 		}
 	}
 	if sawIndet {

@@ -155,6 +155,9 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 		ReturnTags: in.ReturnTags,
 		Candidates: candidates,
 	}
+	if in.TimeContext != nil {
+		job.TimeContext = in.TimeContext.Timezone
+	}
 	if err := a.Store.CreateScan(job); err != nil {
 		return fail(storeErrorCode(err), err.Error())
 	}
@@ -184,7 +187,14 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 	if err := json.Unmarshal(job.QueryJSON, &node); err != nil {
 		return fail("CHECKPOINT_CORRUPT", err.Error())
 	}
-	prepared, err := query.Prepare(&node, in.TimeContext)
+	// The scan's original timezone assumption is authoritative; a
+	// time_context sent with the resume call only fills in when the
+	// scan was started without one.
+	tc := in.TimeContext
+	if job.TimeContext != "" {
+		tc = &query.TimeContext{Timezone: job.TimeContext}
+	}
+	prepared, err := query.Prepare(&node, tc)
 	if err != nil {
 		return fail("CHECKPOINT_CORRUPT", err.Error())
 	}

@@ -67,10 +67,10 @@ func (p *Prepared) compare(n *pnode, v any) (Tri, string) {
 		}
 		return agg, ""
 	case "before", "after":
-		return p.compareDateOrder(n, v, n.operator == "before")
+		return p.compareDateOrder(n, v)
 	case "gt", "gte", "lt", "lte":
 		if n.valueType == "datetime" {
-			return p.compareDateOrder(n, v, n.operator == "lt" || n.operator == "lte")
+			return p.compareDateOrder(n, v)
 		}
 		return p.compareNumberOrder(n, v)
 	case "between":
@@ -215,16 +215,26 @@ func (p *Prepared) compareBetween(n *pnode, v any) (Tri, string) {
 	return NoMatch, ""
 }
 
-func (p *Prepared) compareDateOrder(n *pnode, v any, less bool) (Tri, string) {
+// compareDateOrder applies the node's ordering operator to a datetime
+// value. The inclusive operators (gte/lte) accept an exact match with
+// the bound; before/after are strict, like gt/lt.
+func (p *Prepared) compareDateOrder(n *pnode, v any) (Tri, string) {
 	bound, ok := n.value.(string)
 	if !ok {
 		return Indeterminate, "datetime bound must be a string"
 	}
 	return p.compareDate(v, bound, func(c int) bool {
-		if less {
+		switch n.operator {
+		case "before", "lt":
 			return c < 0
+		case "after", "gt":
+			return c > 0
+		case "lte":
+			return c <= 0
+		case "gte":
+			return c >= 0
 		}
-		return c > 0
+		return false
 	})
 }
 

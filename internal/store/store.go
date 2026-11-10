@@ -71,15 +71,19 @@ type ResultMeta struct {
 
 // ScanJob is the persisted checkpoint of one search scan.
 type ScanJob struct {
-	ID         string           `json:"id"`
-	ResultID   string           `json:"result_id"`
-	QueryJSON  json.RawMessage  `json:"query"`
-	SpecJSON   json.RawMessage  `json:"spec"`
-	ReturnTags []string         `json:"return_tags,omitempty"`
-	CreatedAt  time.Time        `json:"created_at"`
-	ExpiresAt  time.Time        `json:"expires_at"`
-	Candidates []meta.Candidate `json:"candidates"`
-	NextIndex  int              `json:"next_index"`
+	ID         string          `json:"id"`
+	ResultID   string          `json:"result_id"`
+	QueryJSON  json.RawMessage `json:"query"`
+	SpecJSON   json.RawMessage `json:"spec"`
+	ReturnTags []string        `json:"return_tags,omitempty"`
+	// TimeContext is the timezone assumption the scan was started
+	// with. A resume must reuse it: accepting a different (or no)
+	// assumption on resume would silently change verdicts mid-scan.
+	TimeContext string           `json:"time_context,omitempty"`
+	CreatedAt   time.Time        `json:"created_at"`
+	ExpiresAt   time.Time        `json:"expires_at"`
+	Candidates  []meta.Candidate `json:"candidates"`
+	NextIndex   int              `json:"next_index"`
 	// CommittedRecords is the number of result records written by
 	// committed batches. On resume it is reconciled with the result
 	// store: a mismatch means a crash mid-commit and is reported as
