@@ -63,6 +63,46 @@ func TestRecordsPagingReconstructs1000(t *testing.T) {
 	}
 }
 
+func TestRecordsPageByteBudgetAcrossSegments(t *testing.T) {
+	// Three segments of one record each (A, B, C). A byte budget that
+	// fits A but not B must return exactly [A] — never [A, C] with B
+	// silently skipped — and paging must reconstruct A, B, C in order.
+	s := newStore(t)
+	m, err := s.CreateResult(KindRecords)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := []string{`{"v":"AAA"}`, `{"v":"BBB"}`, `{"v":"CCC"}`}
+	for _, r := range recs {
+		if _, err := s.AppendRecords(m.ID, []json.RawMessage{json.RawMessage(r)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	budget := len(recs[0]) + 1 // fits one record, not two
+	var got []string
+	offset := 0
+	for i := 0; i < 5; i++ {
+		_, page, err := s.RecordsPage(m.ID, offset, 0, budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Records) != 1 {
+			t.Fatalf("page %d: expected exactly 1 record, got %d (%v)", i, len(page.Records), page.Records)
+		}
+		got = append(got, string(page.Records[0]))
+		offset = page.NextOffset
+		if !page.HasMore {
+			break
+		}
+	}
+	if strings.Join(got, ",") != strings.Join(recs, ",") {
+		t.Fatalf("reconstruction mismatch: got %v want %v", got, recs)
+	}
+	if offset != 3 {
+		t.Fatalf("final offset = %d, want 3", offset)
+	}
+}
+
 func TestBlobFragmentReconstruction(t *testing.T) {
 	s := newStore(t)
 	data := bytes.Repeat([]byte("0123456789abcdef"), 5000) // 80000 bytes

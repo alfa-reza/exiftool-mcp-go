@@ -102,14 +102,18 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) (Result, error) {
 		res.ExitCode = cmd.ProcessState.ExitCode()
 	}
 	if err != nil {
+		// Cancellation and timeout come first: when CommandContext
+		// kills the process, cmd.Run reports an *exec.ExitError
+		// ("signal: killed"), which must not be mistaken for an
+		// ordinary non-zero exit and fed to the parser as data.
+		if ctx.Err() != nil {
+			return res, ctx.Err()
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			// Non-zero exit is data, not a Go error: callers decide based
 			// on stdout/stderr (batch reads exit 1 on partial failures).
 			return res, nil
-		}
-		if ctx.Err() != nil {
-			return res, ctx.Err()
 		}
 		if errors.Is(err, exec.ErrNotFound) {
 			return res, fmt.Errorf("%w: %s", ErrNotFound, r.path)

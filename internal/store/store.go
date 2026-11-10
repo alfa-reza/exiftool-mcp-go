@@ -327,6 +327,12 @@ func (s *Store) RecordsPage(id string, offset, pageSize int, maxBytes int) (*Res
 	page := &Page{}
 	skip := offset
 	var used int
+	// Records are consumed strictly in order. Reaching the page size
+	// or the byte budget ends the whole page: continuing into the next
+	// segment after a mid-segment stop would skip the unconsumed
+	// records of the current segment while the cursor (derived from
+	// the returned count) advances past them, losing them forever.
+segments:
 	for _, seg := range m.Segments {
 		if pageSize > 0 && len(page.Records) >= pageSize {
 			break
@@ -349,10 +355,10 @@ func (s *Store) RecordsPage(id string, offset, pageSize int, maxBytes int) (*Res
 				continue
 			}
 			if pageSize > 0 && len(page.Records) >= pageSize {
-				break
+				break segments
 			}
 			if maxBytes > 0 && len(page.Records) > 0 && used+len(line) > maxBytes {
-				break
+				break segments
 			}
 			page.Records = append(page.Records, json.RawMessage(line))
 			used += len(line)
