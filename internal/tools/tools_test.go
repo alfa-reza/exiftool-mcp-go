@@ -1075,7 +1075,15 @@ func (stallRunner) Run(ctx context.Context, args ...string) (runner.Result, erro
 	if strings.Contains(f, "b.jpg") {
 		make_ = "Nikon"
 	}
-	return runner.Result{Stdout: []byte(`[{"SourceFile":"` + f + `","EXIF:IFD0:Make":"` + make_ + `"}]`)}, nil
+	// Marshal properly: a Windows path's backslashes are not valid
+	// JSON string escapes when concatenated by hand.
+	payload, err := json.Marshal([]map[string]string{
+		{"SourceFile": f, "EXIF:IFD0:Make": make_},
+	})
+	if err != nil {
+		return runner.Result{}, err
+	}
+	return runner.Result{Stdout: payload}, nil
 }
 
 func TestSearchBatchTimeoutFallsBackPerFile(t *testing.T) {
@@ -1159,7 +1167,13 @@ func TestReadOversizedValueStoreFailureIsLoud(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "big.jpg")
 	writeJPEG(t, p)
-	cli(t, "-q", "-overwrite_original", "-Comment="+strings.Repeat("x", 40000), p)
+	// The 40 KB value travels in a file (-TAG<=file): passing it as
+	// a command-line argument exceeds the Windows process limit.
+	valueFile := filepath.Join(dir, "comment.txt")
+	if err := os.WriteFile(valueFile, []byte(strings.Repeat("x", 40000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli(t, "-q", "-overwrite_original", "-Comment<="+valueFile, p)
 	storeDir := t.TempDir()
 	cfg := config.Config{
 		StoreDir: storeDir, CallTimeout: 60 * time.Second, MaxConcurrency: 4,
