@@ -337,3 +337,36 @@ func TestEnumerateTraversalErrorReported(t *testing.T) {
 		t.Fatalf("the readable file should still be a candidate, got %d", len(cands))
 	}
 }
+
+func TestValidateSelectorRejectsWriteOptions(t *testing.T) {
+	// Names that must never become argv: write-capable options and
+	// their documented aliases, plus the alias class that slipped
+	// through an earlier, incomplete denylist. If ExifTool is
+	// upgraded and this test needs new names, extend the extraction
+	// in options.go — do not weaken the test.
+	bad := []string{
+		// write-capable options and aliases
+		"w", "W", "textOut", "tagOut", "o", "overwrite_original",
+		"restore_original", "delete_original", "savePath", "saveFormat",
+		"saveBin", "writeMode", "out", "diff",
+		// file-reading / config options
+		"config", "stay_open", "api", "common_args", "tagsFromFile",
+		"addTagsFromFile", "srcFile", "geotag",
+		// the alias class from the round-4 review
+		"groupNames", "json", "binary", "printConv", "extractEmbedded",
+		// parameterized forms of listed bases
+		"htmldump0", "echo2", "fileOrder4", "sort2", "s3",
+	}
+	for _, name := range bad {
+		if err := ValidateSelector(name); err == nil {
+			t.Errorf("selector %q must be rejected (it is an ExifTool option)", name)
+		}
+	}
+	// Real tag names keep working bare, and any collision-prone tag
+	// remains reachable in qualified form.
+	for _, ok := range []string{"SerialNumber", "Comment", "Make", "ISO", "EXIF:SerialNumber", "File:FileName"} {
+		if err := ValidateSelector(ok); err != nil {
+			t.Errorf("selector %q should be accepted: %v", ok, err)
+		}
+	}
+}
