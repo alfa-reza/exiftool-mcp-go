@@ -28,7 +28,10 @@ func TestValidateSelector(t *testing.T) {
 		"config", "stay_open", "restore_original", "delete_original",
 		"overwrite_original", "overwrite_original_in_place", "tagsFromFile",
 		"srcfile", "filename", "directory", "api", "if", "p", "ver", "j",
-		"all", "Config", "STAY_OPEN"}
+		"all", "Config", "STAY_OPEN",
+		// Parameterized option forms: an option name plus digits is
+		// still an option (-fast2, -ee3, -g4), never a tag.
+		"g4", "G3", "fast2", "ee3", "fast5", "g0"}
 	for _, s := range bad {
 		if err := ValidateSelector(s); err == nil {
 			t.Errorf("selector %q should be rejected", s)
@@ -48,9 +51,37 @@ func TestSpecArgs(t *testing.T) {
 	}
 	s2 := ReadSpec{IncludeDuplicates: true, UnknownTags: 2, EmbeddedLevel: 2, NumericValues: true, PreserveStructures: true, FastScanLevel: 2}
 	args2 := strings.Join(s2.Args(), " ")
-	for _, want := range []string{"-a", "-G4", "-U", "-eee", "-G3", "-n", "-struct", "-fast2"} {
+	for _, want := range []string{"-a", "-G4", "-U", "-ee2", "-G3", "-n", "-struct", "-fast2"} {
 		if !strings.Contains(args2, want) {
 			t.Errorf("args %q missing %q", args2, want)
+		}
+	}
+}
+
+func TestParseJSONArrayRejectsTruncation(t *testing.T) {
+	// Output cut after a complete object (the closing bracket never
+	// arrived) must not parse as a successful read.
+	if _, err := ParseJSONArray([]byte(`[{"SourceFile":"a.jpg","EXIF:Make":"Canon"}`)); err == nil {
+		t.Fatal("truncated JSON array was accepted")
+	}
+	if _, err := ParseJSONArray([]byte(`[{"SourceFile":"a.jpg"},{"SourceFile":"b.jpg"}`)); err == nil {
+		t.Fatal("JSON array missing its closing bracket was accepted")
+	}
+	objects, err := ParseJSONArray([]byte(`[{"SourceFile":"a.jpg"}]`))
+	if err != nil || len(objects) != 1 {
+		t.Fatalf("valid array rejected: %v (%d objects)", err, len(objects))
+	}
+}
+
+func TestEmbeddedLevelArgsDocumentedForm(t *testing.T) {
+	// The documented option form is -ee[NUM].
+	for level, want := range map[int]string{1: "-ee", 2: "-ee2", 3: "-ee3"} {
+		args := strings.Join(ReadSpec{EmbeddedLevel: level}.Args(), " ")
+		if !strings.Contains(args, " "+want+" ") && !strings.HasSuffix(args, " "+want) && !strings.Contains(args, want) {
+			t.Errorf("level %d: args %q missing %q", level, args, want)
+		}
+		if strings.Contains(args, "-eee") && want != "-ee3" {
+			t.Errorf("level %d: args %q use the undocumented repeated-e form", level, args)
 		}
 	}
 }

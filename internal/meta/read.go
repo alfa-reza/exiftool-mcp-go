@@ -214,6 +214,16 @@ func ParseJSONArray(data []byte) ([][]Pair, error) {
 		}
 		objects = append(objects, obj)
 	}
+	// The array must be closed. Output truncated after a complete
+	// object (a killed or output-capped ExifTool run) would otherwise
+	// parse as a successful, complete read.
+	tok, err = dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("truncated JSON array: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != ']' {
+		return nil, fmt.Errorf("expected closing ']' in JSON array")
+	}
 	return objects, nil
 }
 
