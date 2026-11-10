@@ -125,6 +125,9 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 	type diag struct{ errors, warnings []string }
 	byOperand := make(map[string]*diag)
 	for _, line := range strings.Split(stderr, "\n") {
+		// Windows child output ends lines with CRLF; a trailing \r
+		// would poison the operand comparison.
+		line = strings.TrimSuffix(line, "\r")
 		var kind, rest string
 		switch {
 		case strings.HasPrefix(line, "Error: "):

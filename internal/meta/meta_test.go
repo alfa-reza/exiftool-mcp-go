@@ -155,7 +155,8 @@ func TestReadCorrelatesAcrossSlashStyles(t *testing.T) {
 	// misreported as "no output from exiftool for this file".
 	fr := &fakeRunner{
 		stdout: []byte(`[{"SourceFile":"C:/x/bad.jpg"},{"SourceFile":"C:/x/good.jpg","EXIF:IFD0:Make":"Canon"}]`),
-		stderr: "Error: File format error - C:/x/bad.jpg\n",
+		// Forward slashes AND a CRLF line ending, as on Windows.
+		stderr: "Error: File format error - C:/x/bad.jpg\r\n",
 	}
 	r := &Reader{Runner: fr}
 	results, err := r.Read(context.Background(), []string{`C:\x\bad.jpg`, `C:\x\good.jpg`},
