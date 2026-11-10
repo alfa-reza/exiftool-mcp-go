@@ -81,6 +81,12 @@ func runText(ctx context.Context, r runner.Runner, arg string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The runner reports a nonzero ExifTool exit as data, not as a
+	// Go error (batch reads rely on that); for catalog listings a
+	// failed command must not masquerade as an empty listing.
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("exiftool %s failed with exit code %d: %s", arg, res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
 	return res.Stdout, nil
 }
 

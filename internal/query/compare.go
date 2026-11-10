@@ -87,11 +87,26 @@ func (p *Prepared) compare(n *pnode, v any) (Tri, string) {
 	return Indeterminate, "unsupported operator"
 }
 
+// inferKindEquality picks the comparison kind for eq/ne. Two
+// strings that merely PARSE as datetimes stay text, exactly like
+// numeric-looking strings: identifiers can look like dates
+// ("2026-11-10" is not the same identifier as "2026:11:10"), and
+// datetime equality is available through an explicit
+// value_type of "datetime". (Range comparisons keep the full
+// inference in inferKind: ordering a date-like string as text
+// would be meaningless.)
+func inferKindEquality(queryVal, entryVal any) string {
+	if inferKind(queryVal, entryVal) == "number" {
+		return "number"
+	}
+	return "text"
+}
+
 // compareEqual compares for equality using the declared or inferred kind.
 func (p *Prepared) compareEqual(n *pnode, v any) (Tri, string) {
 	kind := n.valueType
 	if kind == "" {
-		kind = inferKind(n.value, v)
+		kind = inferKindEquality(n.value, v)
 	}
 	switch kind {
 	case "number":

@@ -138,6 +138,11 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 	include := collectQueryTags(in.Query)
 	include = appendUnique(include, in.ReturnTags...)
 	spec := in.ReadOptions.Spec(include, nil)
+	if queryNeedsProvenance(in.Query) {
+		// same_document verdicts need document identity in the
+		// entries; request family 3 without forcing -ee.
+		spec.DocProvenance = true
+	}
 	if err := spec.Validate(); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
@@ -458,7 +463,9 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 		return fail(storeErrorCode(err), err.Error())
 	}
 	if job.Done {
-		_ = a.Store.MarkComplete(job.ResultID)
+		if err := a.Store.MarkComplete(job.ResultID); err != nil {
+			return fail(storeErrorCode(err), err.Error())
+		}
 	}
 	pageN, _, err := pageByBudget(callRecords, a.Cfg.DefaultPageSize, a.Cfg.MaxResponseBytes)
 	if err == nil && pageN < len(callRecords) {
@@ -506,6 +513,24 @@ func collectQueryTags(n *query.Node) []string {
 	}
 	walk(n)
 	return out
+}
+
+// queryNeedsProvenance reports whether any node in the query uses
+// the same_document scope; such queries can only reach determinate
+// verdicts when the read entries carry document identity.
+func queryNeedsProvenance(n *query.Node) bool {
+	if n == nil {
+		return false
+	}
+	if n.Scope == "same_document" {
+		return true
+	}
+	for _, c := range n.Children {
+		if queryNeedsProvenance(c) {
+			return true
+		}
+	}
+	return false
 }
 
 func appendUnique(list []string, items ...string) []string {

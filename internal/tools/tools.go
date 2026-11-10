@@ -89,16 +89,17 @@ func filterSelectors(f *MetadataFilter) (include, exclude []string, mode string,
 }
 
 // guardFastLevel rejects read options whose extraction level cannot
-// support conclusions. fast_scan_level 2 already omits MakerNotes
-// and other metadata, and level 3+ extracts none at all (system tags
-// only), so a query verdict or a diff computed over such a read
-// would mistake "not read" for "not present" — most dangerously for
-// `missing` predicates. Plain reads keep the option: there the
-// caller asked for the extraction itself, and the effective options
-// disclose it.
+// support conclusions. Even level 1 skips regions of the file (the
+// JPEG trailer, later GIF comments, WAV/AVI data), level 2 also
+// omits MakerNotes, and level 3+ extracts nothing at all (system
+// tags only) — so a query verdict or a diff computed over such a
+// read would mistake "not read" for "not present", most
+// dangerously for `missing` predicates. Plain reads keep the
+// option: there the caller asked for the extraction itself, and
+// the effective options disclose it.
 func guardFastLevel(spec meta.ReadSpec) error {
-	if spec.FastScanLevel >= 2 {
-		return fmt.Errorf("fast_scan_level %d skips parts of the metadata (level 2 already omits MakerNotes and other data, level 3+ extracts none) and cannot support conclusions about tag presence or values", spec.FastScanLevel)
+	if spec.FastScanLevel >= 1 {
+		return fmt.Errorf("fast_scan_level %d skips parts of the file (level 1 already skips trailers and later data regions, level 2 also omits MakerNotes, level 3+ extracts no metadata) and cannot support conclusions about tag presence or values", spec.FastScanLevel)
 	}
 	return nil
 }
