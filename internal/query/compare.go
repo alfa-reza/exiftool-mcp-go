@@ -2,6 +2,8 @@ package query
 
 import (
 	"encoding/json"
+	"math/big"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -93,12 +95,11 @@ func (p *Prepared) compareEqual(n *pnode, v any) (Tri, string) {
 	}
 	switch kind {
 	case "number":
-		a, okA := toNumber(v)
-		b, okB := toNumber(n.value)
-		if !okA || !okB {
+		c, ok := cmpNumeric(v, n.value)
+		if !ok {
 			return Indeterminate, "value is not numeric"
 		}
-		if a == b {
+		if c == 0 {
 			return Match, ""
 		}
 		return NoMatch, ""
@@ -141,21 +142,20 @@ func inferKind(queryVal, entryVal any) string {
 }
 
 func (p *Prepared) compareNumberOrder(n *pnode, v any) (Tri, string) {
-	a, okA := toNumber(v)
-	b, okB := toNumber(n.value)
-	if !okA || !okB {
+	c, ok := cmpNumeric(v, n.value)
+	if !ok {
 		return Indeterminate, "value is not numeric"
 	}
 	var hit bool
 	switch n.operator {
 	case "gt":
-		hit = a > b
+		hit = c > 0
 	case "gte":
-		hit = a >= b
+		hit = c >= 0
 	case "lt":
-		hit = a < b
+		hit = c < 0
 	case "lte":
-		hit = a <= b
+		hit = c <= 0
 	}
 	if hit {
 		return Match, ""
@@ -200,16 +200,15 @@ func (p *Prepared) compareBetween(n *pnode, v any) (Tri, string) {
 		return NoMatch, ""
 	}
 	// numeric between (inclusive)
-	a, okA := toNumber(v)
-	lo, okL := toNumber(bounds[0])
-	hi, okH := toNumber(bounds[1])
-	if !okA {
+	if _, ok := toNumber(v); !ok {
 		return Indeterminate, "value is not numeric"
 	}
+	cLo, okL := cmpNumeric(v, bounds[0])
+	cHi, okH := cmpNumeric(v, bounds[1])
 	if !okL || !okH {
 		return Indeterminate, "between bounds are not numeric"
 	}
-	if a >= lo && a <= hi {
+	if cLo >= 0 && cHi <= 0 {
 		return Match, ""
 	}
 	return NoMatch, ""
@@ -330,6 +329,66 @@ func parseDateTime(s string) (parsedDate, bool) {
 		}
 	}
 	return parsedDate{}, false
+}
+
+// cmpNumeric orders two values numerically, or reports that they
+// are not both numeric (eligibility follows toNumber). Integers
+// beyond float64 precision must compare exactly — 9007199254740993
+// and 9007199254740992 are different numbers — so when both sides
+// have an exact rational form the comparison is exact, and float64
+// is only the fallback for values without one.
+func cmpNumeric(a, b any) (int, bool) {
+	if _, ok := toNumber(a); !ok {
+		return 0, false
+	}
+	if _, ok := toNumber(b); !ok {
+		return 0, false
+	}
+	ra, okA := exactRat(a)
+	rb, okB := exactRat(b)
+	if okA && okB {
+		return ra.Cmp(rb), true
+	}
+	fa, _ := toNumber(a)
+	fb, _ := toNumber(b)
+	switch {
+	case fa < fb:
+		return -1, true
+	case fa > fb:
+		return 1, true
+	}
+	return 0, true
+}
+
+var decimalLiteral = regexp.MustCompile(`^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$`)
+
+// exactRat converts a value to its exact rational form when it has
+// one: JSON numbers and plain decimal strings convert exactly, and a
+// float64 converts to its exact binary value. Anything else reports
+// false and the caller falls back to float64 comparison.
+func exactRat(v any) (*big.Rat, bool) {
+	switch x := v.(type) {
+	case json.Number:
+		return ratFromDecimal(x.String())
+	case string:
+		return ratFromDecimal(strings.TrimSpace(x))
+	case float64:
+		r := new(big.Rat).SetFloat64(x)
+		return r, r != nil
+	case int:
+		return big.NewRat(int64(x), 1), true
+	case int64:
+		return big.NewRat(x, 1), true
+	}
+	return nil, false
+}
+
+func ratFromDecimal(s string) (*big.Rat, bool) {
+	if !decimalLiteral.MatchString(s) {
+		return nil, false
+	}
+	r, ok := new(big.Rat).SetString(s)
+	return r, ok
 }
 
 // toNumber converts a JSON-ish value to float64 without guessing:
