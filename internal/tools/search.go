@@ -145,9 +145,6 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
 	candidates, enumErrs := meta.Enumerate(in.Paths, in.Recursive, in.Extensions)
-	for _, e := range enumErrs {
-		out.Errors = append(out.Errors, ToolError{Code: e.Code, Message: e.Message, Path: e.Path})
-	}
 	result, err := a.Store.CreateResult(store.KindRecords)
 	if err != nil {
 		return fail(storeErrorCode(err), err.Error())
@@ -160,6 +157,14 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 		SpecJSON:   specJSON,
 		ReturnTags: in.ReturnTags,
 		Candidates: candidates,
+	}
+	// Enumeration errors are part of the scan's persisted state:
+	// they are reported by every batch call (via ErrorDetails) and
+	// keep the final status partial — part of the requested input
+	// was never examined, so the scan is not "complete".
+	for _, e := range enumErrs {
+		job.EnumErrors++
+		addScanError(job, e.Code, e.Message, e.Path)
 	}
 	if in.TimeContext != nil {
 		job.TimeContext = in.TimeContext.Timezone
@@ -420,7 +425,7 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	if !job.Done {
 		out.ResumeToken = job.ID
 		out.Status = "partial"
-	} else if job.Errors > 0 {
+	} else if job.Errors > 0 || job.EnumErrors > 0 {
 		out.Status = "partial"
 	}
 	// Report the scan's accumulated per-file errors (persisted in the

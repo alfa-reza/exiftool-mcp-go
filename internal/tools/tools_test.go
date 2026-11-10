@@ -1115,3 +1115,37 @@ func TestSearchBatchTimeoutFallsBackPerFile(t *testing.T) {
 		t.Fatalf("wrong counts after per-file fallback: %+v", out)
 	}
 }
+
+func TestSearchEnumerationErrorKeepsStatusPartial(t *testing.T) {
+	// One input path does not exist: the scan over the valid path
+	// completes, but the final status must stay partial and the
+	// enumeration error must be reported — part of the requested
+	// input was never examined.
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir, filepath.Join(dir, "does-not-exist")},
+		Query:       q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.ScanComplete {
+		t.Fatalf("scan over the valid path should complete: %+v", out)
+	}
+	if out.Status != "partial" {
+		t.Fatalf("status must stay partial when enumeration failed, got %q", out.Status)
+	}
+	found := false
+	for _, e := range out.Errors {
+		if e.Code == "PATH_NOT_FOUND" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("enumeration error not reported: %+v", out.Errors)
+	}
+}

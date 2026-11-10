@@ -101,13 +101,18 @@ type ScanJob struct {
 	// never persisted and adopting the records would corrupt the
 	// counts. Fewer records than the checkpoint claims is genuine
 	// corruption.
-	CommittedRecords int  `json:"committed_records"`
-	Processed        int  `json:"processed"`
-	Matched          int  `json:"matched"`
-	NoMatch          int  `json:"no_match"`
-	Indet            int  `json:"indeterminate"`
-	Errors           int  `json:"errors"`
-	Done             bool `json:"done"`
+	CommittedRecords int `json:"committed_records"`
+	Processed        int `json:"processed"`
+	Matched          int `json:"matched"`
+	NoMatch          int `json:"no_match"`
+	Indet            int `json:"indeterminate"`
+	Errors           int `json:"errors"`
+	// EnumErrors counts input paths that produced no candidates at
+	// enumeration time (details ride in ErrorDetails). A scan with
+	// enumeration errors is never reported as fully complete: part
+	// of the requested input was never examined.
+	EnumErrors int  `json:"enum_errors,omitempty"`
+	Done       bool `json:"done"`
 	// ErrorDetails persists the per-file errors of all batches (the
 	// exact total is Errors; details are capped by the tools layer),
 	// so a resumed scan still reports why earlier files failed.
