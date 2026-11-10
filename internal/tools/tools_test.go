@@ -345,9 +345,10 @@ func TestSearchResumeKeepsTimeContext(t *testing.T) {
 func TestSearchResumeAfterCrashWindow(t *testing.T) {
 	// Simulate a crash between committing a batch's records and
 	// saving its checkpoint: the records stay, the checkpoint is
-	// rewound to the pre-batch state. Resume must recover from the
-	// committed records — not fail with CHECKPOINT_CORRUPT and not
-	// duplicate any record.
+	// rewound to the pre-batch state. Resume must roll the
+	// uncounted records back and reprocess the batch — not fail
+	// with CHECKPOINT_CORRUPT, not duplicate any record, and not
+	// lose the crashed batch's error classification.
 	dir := setupPhotos(t)
 	storeDir := t.TempDir()
 	ctx := context.Background()
@@ -377,7 +378,7 @@ func TestSearchResumeAfterCrashWindow(t *testing.T) {
 	if err := app1.Store.SaveScan(job); err != nil {
 		t.Fatal(err)
 	}
-	// Resume after a restart: recovery rebuilds the checkpoint.
+	// Resume after a restart: rollback + reprocessing.
 	app2, _ := newTestApp(t, storeDir)
 	_, out2, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{ResumeToken: out1.ResumeToken})
 	if err != nil {
@@ -390,7 +391,7 @@ func TestSearchResumeAfterCrashWindow(t *testing.T) {
 		t.Fatalf("scan did not complete after recovery: %+v", out2)
 	}
 	if out2.MatchedCount != 2 || out2.NoMatchCount != 1 || out2.ErrorCount != 1 {
-		t.Fatalf("counts after recovery wrong: %+v", out2)
+		t.Fatalf("counts after rollback wrong: %+v", out2)
 	}
 	_, page, err := app2.getResultPage(ctx, nil, GetResultPageIn{ResultID: out2.ResultID, PageSize: 10})
 	if err != nil {
@@ -399,7 +400,7 @@ func TestSearchResumeAfterCrashWindow(t *testing.T) {
 	if len(page.Items) != 2 {
 		t.Fatalf("expected exactly 2 stored records (no duplicates), got %d", len(page.Items))
 	}
-	// The corrupt file's error, recorded by the post-recovery batch,
+	// The corrupt file's error, recorded by the reprocessed batch,
 	// is part of the persisted error history.
 	foundErr := false
 	for _, e := range out2.Errors {
@@ -653,6 +654,174 @@ func TestCompareIntegration(t *testing.T) {
 	}
 }
 
+func TestCompareDuplicateCopyPairing(t *testing.T) {
+	requireExifTool(t)
+	build := func(comments ...string) string {
+		data := jpegBytes(t)
+		com := func(s string) []byte {
+			seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+			return append(seg, s...)
+		}
+		out := append([]byte{}, data[:2]...)
+		for _, c := range comments {
+			out = append(out, com(c)...)
+		}
+		out = append(out, data[2:]...)
+		p := filepath.Join(t.TempDir(), "x.jpg")
+		if err := os.WriteFile(p, out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	left := build("alpha", "beta")
+	right := build("beta") // first copy deleted; "beta" renumbers to copy one
+	app, _ := newTestApp(t, t.TempDir())
+	_, out, err := app.compareMetadata(context.Background(), nil, CompareMetadataIn{
+		LeftPath: left, RightPath: right,
+		MetadataFilter:   &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+		ReadOptions:      &ReadOptionsInput{IncludeDuplicates: true},
+		IncludeUnchanged: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The honest diff: alpha was removed, beta is unchanged, and no
+	// value "changed" — positional pairing fabricated exactly that.
+	if len(out.Changed) != 0 {
+		t.Fatalf("no value changed, got %+v", out.Changed)
+	}
+	if len(out.Removed) != 1 || out.Removed[0].LeftValue != "alpha" {
+		t.Fatalf("alpha should be the removal, got %+v", out.Removed)
+	}
+	if len(out.Unchanged) != 1 || out.Unchanged[0].LeftValue != "beta" {
+		t.Fatalf("beta should be unchanged, got %+v", out.Unchanged)
+	}
+}
+
+func TestCompareUnchangedExcludedFromPages(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	_, out, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: filepath.Join(dir, "a.jpg"), RightPath: filepath.Join(dir, "c.jpg"),
+		ResponseOptions: &ResponseOptionsInput{PageSize: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.UnchangedCount == 0 {
+		t.Fatal("expected some unchanged tags between the two Canon photos")
+	}
+	if len(out.Unchanged) != 0 {
+		t.Fatalf("unchanged records leaked into the response: %+v", out.Unchanged)
+	}
+	if out.ResultID == "" {
+		t.Fatal("expected overflow to be stored for paging")
+	}
+	_, page, err := app.Store.RecordsPage(out.ResultID, 0, 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawChange := false
+	for _, raw := range page.Records {
+		var rec ChangeRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Change == "unchanged" {
+			t.Fatalf("unchanged record leaked into the stored result: %+v", rec)
+		}
+		if rec.Change == "changed" {
+			sawChange = true
+		}
+	}
+	if !sawChange {
+		t.Fatal("stored result should contain the ISO change")
+	}
+}
+
+func TestFilterModeTypoRejected(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	a := filepath.Join(dir, "a.jpg")
+	_, out, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:          []string{a},
+		MetadataFilter: &MetadataFilter{Mode: "slect", IncludeTags: []string{"Make"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("mistyped filter mode must be rejected, got %+v", out)
+	}
+	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: a, RightPath: a,
+		MetadataFilter: &MetadataFilter{Mode: "slect"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cout.Status != "failed" || len(cout.Errors) == 0 || cout.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("mistyped filter mode must be rejected in compare, got %+v", cout)
+	}
+}
+
+func TestFastLevelGuardForConclusions(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	a := filepath.Join(dir, "a.jpg")
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("search with fast_scan_level 3 must be rejected, got %+v", out)
+	}
+	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: a, RightPath: a,
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cout.Status != "failed" || len(cout.Errors) == 0 || cout.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("compare with fast_scan_level 4 must be rejected, got %+v", cout)
+	}
+	// A plain read keeps the option: the caller asked for the
+	// extraction itself, and the effective options disclose it.
+	_, rout, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:       []string{a},
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rout.Status == "failed" {
+		t.Fatalf("plain read with fast_scan_level 3 should not be rejected: %+v", rout)
+	}
+}
+
+func TestSearchTagCaseInsensitive(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "predicate", Tag: "make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.MatchedCount != 2 {
+		t.Fatalf("lowercase tag should match both Canon photos: %+v", out)
+	}
+}
+
 func TestDiscoverIntegration(t *testing.T) {
 	dir := setupPhotos(t)
 	app, _ := newTestApp(t, t.TempDir())
@@ -772,5 +941,246 @@ func TestPagingDoesNotInvokeExifTool(t *testing.T) {
 	}
 	if cr.calls.Load() != callsBefore {
 		t.Fatal("get_result_page invoked exiftool")
+	}
+}
+
+func TestSearchResumeCannotChangeTimeContext(t *testing.T) {
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+
+	// A scan started WITHOUT a time_context cannot gain one on
+	// resume: later batches would judge datetimes by a rule the
+	// earlier batches did not use.
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out2, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		ResumeToken: out1.ResumeToken,
+		TimeContext: &query.TimeContext{Timezone: "Asia/Jakarta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Status != "failed" || len(out2.Errors) == 0 || out2.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("adding a time_context on resume must be rejected: %+v", out2)
+	}
+
+	// A scan started WITH one cannot switch to another, but may
+	// repeat the same one.
+	app2, _ := newTestApp(t, storeDir)
+	_, out3, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+		TimeContext: &query.TimeContext{Timezone: "Asia/Jakarta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out4, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{
+		ResumeToken: out3.ResumeToken,
+		TimeContext: &query.TimeContext{Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out4.Status != "failed" || len(out4.Errors) == 0 || out4.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("changing the time_context on resume must be rejected: %+v", out4)
+	}
+	_, out5, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{
+		ResumeToken: out3.ResumeToken,
+		TimeContext: &query.TimeContext{Timezone: "Asia/Jakarta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out5.Status == "failed" {
+		t.Fatalf("repeating the same time_context must be accepted: %+v", out5)
+	}
+}
+
+func TestSearchConcurrentResumeAcrossApps(t *testing.T) {
+	// Two App instances over one store directory stand in for two
+	// server processes sharing it: the store-level scan lock must
+	// serialize their batches so no record is ever duplicated.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app2, _ := newTestApp(t, storeDir)
+	apps := []*App{app1, app2}
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, _ = apps[i%2].searchMetadata(ctx, nil, SearchMetadataIn{
+				ResumeToken: out1.ResumeToken, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+			})
+		}(i)
+	}
+	wg.Wait()
+	job, err := app1.Store.LoadScan(out1.ResumeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.Done || job.Processed != 4 || job.Matched != 2 || job.NoMatch != 1 || job.Errors != 1 {
+		t.Fatalf("scan state after concurrent resumes: %+v", job)
+	}
+	m, err := app1.Store.LoadMeta(job.ResultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.TotalRecords != 2 {
+		t.Fatalf("expected exactly 2 records (no duplicates), got %d", m.TotalRecords)
+	}
+}
+
+// stallRunner simulates a pathological ExifTool: multi-file reads —
+// and reads of the corrupt fixture at any size — block until the
+// context ends, while ordinary single-file reads answer at once.
+type stallRunner struct{}
+
+func (stallRunner) Path() string       { return "stall" }
+func (stallRunner) ConfigMode() string { return "standard" }
+
+func (stallRunner) Run(ctx context.Context, args ...string) (runner.Result, error) {
+	var files []string
+	for _, a := range args {
+		if strings.HasSuffix(a, ".jpg") {
+			files = append(files, a)
+		}
+	}
+	stall := len(files) != 1
+	if len(files) == 1 && strings.Contains(files[0], "corrupt") {
+		stall = true
+	}
+	if stall {
+		<-ctx.Done()
+		return runner.Result{}, ctx.Err()
+	}
+	f := files[0]
+	make_ := "Canon"
+	if strings.Contains(f, "b.jpg") {
+		make_ = "Nikon"
+	}
+	return runner.Result{Stdout: []byte(`[{"SourceFile":"` + f + `","EXIF:IFD0:Make":"` + make_ + `"}]`)}, nil
+}
+
+func TestSearchBatchTimeoutFallsBackPerFile(t *testing.T) {
+	// The batch read times out because one file stalls forever.
+	// The scan must still complete in a single call: healthy files
+	// are read individually and the stalling file becomes a
+	// per-file error instead of a permanent roadblock.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	cfg := config.Config{
+		StoreDir: storeDir, CallTimeout: 2 * time.Second, MaxConcurrency: 4,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 1 << 30,
+		ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	st, err := store.New(storeDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := stallRunner{}
+	app := &App{Cfg: cfg, Runner: sr, Reader: &meta.Reader{Runner: sr}, Store: st}
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 4, MaxSeconds: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status == "failed" {
+		t.Fatalf("batch timeout must not fail the scan: %+v", out.Errors)
+	}
+	if !out.ScanComplete || out.ScannedCount != 4 {
+		t.Fatalf("scan should complete despite the stalling file: %+v", out)
+	}
+	if out.MatchedCount != 2 || out.NoMatchCount != 1 || out.ErrorCount != 1 {
+		t.Fatalf("wrong counts after per-file fallback: %+v", out)
+	}
+}
+
+func TestSearchEnumerationErrorKeepsStatusPartial(t *testing.T) {
+	// One input path does not exist: the scan over the valid path
+	// completes, but the final status must stay partial and the
+	// enumeration error must be reported — part of the requested
+	// input was never examined.
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir, filepath.Join(dir, "does-not-exist")},
+		Query:       q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.ScanComplete {
+		t.Fatalf("scan over the valid path should complete: %+v", out)
+	}
+	if out.Status != "partial" {
+		t.Fatalf("status must stay partial when enumeration failed, got %q", out.Status)
+	}
+	found := false
+	for _, e := range out.Errors {
+		if e.Code == "PATH_NOT_FOUND" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("enumeration error not reported: %+v", out.Errors)
+	}
+}
+
+func TestReadOversizedValueStoreFailureIsLoud(t *testing.T) {
+	// A value too large to inline is externalized to the store.
+	// When that store write fails (here: a quota smaller than the
+	// value), the read must fail loudly — leaving the value inline
+	// would silently blow the response byte budget.
+	requireExifTool(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big.jpg")
+	writeJPEG(t, p)
+	cli(t, "-q", "-overwrite_original", "-Comment="+strings.Repeat("x", 40000), p)
+	storeDir := t.TempDir()
+	cfg := config.Config{
+		StoreDir: storeDir, CallTimeout: 60 * time.Second, MaxConcurrency: 4,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 2048,
+		ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	st, err := store.New(storeDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rn := runner.New(cfg)
+	app := &App{Cfg: cfg, Runner: rn, Reader: &meta.Reader{Runner: rn}, Store: st}
+	_, out, err := app.readMetadata(context.Background(), nil, ReadMetadataIn{
+		Paths:          []string{p},
+		MetadataFilter: &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "RESULT_STORE_FULL" {
+		t.Fatalf("oversized value with a full store must fail as RESULT_STORE_FULL, got %+v", out)
 	}
 }

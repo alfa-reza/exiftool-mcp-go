@@ -61,3 +61,20 @@ func TestRunNonZeroExitIsData(t *testing.T) {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 }
+
+func TestRunCallTimeoutCapsLaterCallerDeadline(t *testing.T) {
+	// A caller context with a distant deadline must not stretch an
+	// invocation past the configured CallTimeout.
+	fake := writeFakeExifTool(t, "exec sleep 5\n")
+	r := New(config.Config{ExifToolPath: fake, CallTimeout: 100 * time.Millisecond})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := r.Run(ctx, "-ver")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("call timeout did not cap the invocation: %v", elapsed)
+	}
+}

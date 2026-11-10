@@ -120,7 +120,11 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) (Result, error) {
 			return Result{}, ctx.Err()
 		}
 	}
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline && r.cfg.CallTimeout > 0 {
+	// The configured per-invocation timeout always applies: a
+	// caller deadline that is LATER than CallTimeout must not
+	// stretch the invocation past its configured limit.
+	// WithTimeout keeps whichever deadline is earlier.
+	if r.cfg.CallTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.cfg.CallTimeout)
 		defer cancel()

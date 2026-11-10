@@ -28,7 +28,10 @@ func TestValidateSelector(t *testing.T) {
 		"config", "stay_open", "restore_original", "delete_original",
 		"overwrite_original", "overwrite_original_in_place", "tagsFromFile",
 		"srcfile", "filename", "directory", "api", "if", "p", "ver", "j",
-		"all", "Config", "STAY_OPEN"}
+		"all", "Config", "STAY_OPEN",
+		// Parameterized option forms: an option name plus digits is
+		// still an option (-fast2, -ee3, -g4), never a tag.
+		"g4", "G3", "fast2", "ee3", "fast5", "g0"}
 	for _, s := range bad {
 		if err := ValidateSelector(s); err == nil {
 			t.Errorf("selector %q should be rejected", s)
@@ -48,9 +51,37 @@ func TestSpecArgs(t *testing.T) {
 	}
 	s2 := ReadSpec{IncludeDuplicates: true, UnknownTags: 2, EmbeddedLevel: 2, NumericValues: true, PreserveStructures: true, FastScanLevel: 2}
 	args2 := strings.Join(s2.Args(), " ")
-	for _, want := range []string{"-a", "-G4", "-U", "-eee", "-G3", "-n", "-struct", "-fast2"} {
+	for _, want := range []string{"-a", "-G4", "-U", "-ee2", "-G3", "-n", "-struct", "-fast2"} {
 		if !strings.Contains(args2, want) {
 			t.Errorf("args %q missing %q", args2, want)
+		}
+	}
+}
+
+func TestParseJSONArrayRejectsTruncation(t *testing.T) {
+	// Output cut after a complete object (the closing bracket never
+	// arrived) must not parse as a successful read.
+	if _, err := ParseJSONArray([]byte(`[{"SourceFile":"a.jpg","EXIF:Make":"Canon"}`)); err == nil {
+		t.Fatal("truncated JSON array was accepted")
+	}
+	if _, err := ParseJSONArray([]byte(`[{"SourceFile":"a.jpg"},{"SourceFile":"b.jpg"}`)); err == nil {
+		t.Fatal("JSON array missing its closing bracket was accepted")
+	}
+	objects, err := ParseJSONArray([]byte(`[{"SourceFile":"a.jpg"}]`))
+	if err != nil || len(objects) != 1 {
+		t.Fatalf("valid array rejected: %v (%d objects)", err, len(objects))
+	}
+}
+
+func TestEmbeddedLevelArgsDocumentedForm(t *testing.T) {
+	// The documented option form is -ee[NUM].
+	for level, want := range map[int]string{1: "-ee", 2: "-ee2", 3: "-ee3"} {
+		args := strings.Join(ReadSpec{EmbeddedLevel: level}.Args(), " ")
+		if !strings.Contains(args, " "+want+" ") && !strings.HasSuffix(args, " "+want) && !strings.Contains(args, want) {
+			t.Errorf("level %d: args %q missing %q", level, args, want)
+		}
+		if strings.Contains(args, "-eee") && want != "-ee3" {
+			t.Errorf("level %d: args %q use the undocumented repeated-e form", level, args)
 		}
 	}
 }
@@ -223,5 +254,86 @@ func TestEnumeratePolicy(t *testing.T) {
 	cands4, _ := Enumerate([]string{root}, true, []string{".JPG"})
 	if len(cands4) != 4 {
 		t.Fatalf("expected 4 with .JPG filter, got %d", len(cands4))
+	}
+}
+
+func TestEnumerateSymlinkRootRecursive(t *testing.T) {
+	// A symlink-to-directory as the walk root must yield the
+	// directory's files: WalkDir Lstats its root, so without
+	// resolving it the walk silently produced zero candidates.
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "a.jpg"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	cands, errs := Enumerate([]string{link}, true, nil)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("symlink root should yield 1 candidate, got %d", len(cands))
+	}
+}
+
+func TestEnumerateSymlinkFileRecursive(t *testing.T) {
+	// A symlink to a regular file inside a walked tree is a
+	// candidate, exactly as in the non-recursive listing.
+	base := t.TempDir()
+	real := filepath.Join(base, "real.jpg")
+	if err := os.WriteFile(real, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(base, "link.jpg")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	cands, errs := Enumerate([]string{base}, true, nil)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("recursive walk should find real + symlinked file, got %d candidates", len(cands))
+	}
+}
+
+func TestEnumerateTraversalErrorReported(t *testing.T) {
+	// An unreadable subtree must surface as an enumeration error;
+	// silently skipping it makes a partial scan look complete.
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "open.jpg"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(base, "locked")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "hidden.jpg"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(sub, 0o755)
+	cands, errs := Enumerate([]string{base}, true, nil)
+	if len(errs) == 0 {
+		t.Skip("directory permissions not enforced in this environment (likely running as root)")
+	}
+	found := false
+	for _, e := range errs {
+		if e.Path == sub && e.Code == "PERMISSION_DENIED" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a PERMISSION_DENIED error for the locked subtree, got %v", errs)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("the readable file should still be a candidate, got %d", len(cands))
 	}
 }

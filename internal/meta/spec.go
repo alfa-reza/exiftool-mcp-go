@@ -14,7 +14,7 @@ type ReadSpec struct {
 	ExcludeTags        []string // selectors to exclude
 	IncludeDuplicates  bool     // -a
 	UnknownTags        int      // 0=off, 1=-u, 2=-U
-	EmbeddedLevel      int      // 0=off, 1=-ee, 2=-eee, 3=-eeee
+	EmbeddedLevel      int      // 0=off, 1=-ee, 2=-ee2, 3=-ee3
 	NumericValues      bool     // -n
 	PreserveStructures bool     // -struct
 	FastScanLevel      int      // 0=off, 1=-fast, 2..5=-fast2..-fast5
@@ -41,10 +41,16 @@ func ValidateSelector(sel string) error {
 	// An unqualified selector becomes the argv element "-" + selector.
 	// If the name is one ExifTool treats as a command-line option, the
 	// process would execute the option instead of selecting the tag,
-	// breaking the read-only boundary. The qualified Group:Name form
-	// can never be an option, so it stays available for such tags.
-	if !strings.Contains(sel, ":") && exiftoolOptionNames[strings.ToLower(sel)] {
-		return fmt.Errorf("tag selector %q collides with an ExifTool option; use the qualified Group:Name form", sel)
+	// breaking the read-only boundary. Option families also take
+	// numeric parameters (-fast2, -ee3, -g4), so a name that is an
+	// option name plus trailing digits is an option too. The
+	// qualified Group:Name form can never be an option, so it stays
+	// available for such tags.
+	if !strings.Contains(sel, ":") {
+		lower := strings.ToLower(sel)
+		if exiftoolOptionNames[lower] || exiftoolOptionNames[strings.TrimRight(lower, "0123456789")] {
+			return fmt.Errorf("tag selector %q collides with an ExifTool option; use the qualified Group:Name form", sel)
+		}
 	}
 	return nil
 }
@@ -80,7 +86,13 @@ func (s ReadSpec) Args() []string {
 	if s.EmbeddedLevel > 0 {
 		// Document/instance families only appear for embedded content.
 		args = append(args, "-G3")
-		args = append(args, "-"+strings.Repeat("e", s.EmbeddedLevel+1))
+		// The documented form is -ee[NUM]: plain -ee for level 1,
+		// -ee2/-ee3 above that (not -eee/-eeee).
+		if s.EmbeddedLevel == 1 {
+			args = append(args, "-ee")
+		} else {
+			args = append(args, fmt.Sprintf("-ee%d", s.EmbeddedLevel))
+		}
 	}
 	if s.IncludeDuplicates {
 		// -G4 adds the copy number to the group so duplicate tags with
