@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"time"
 
@@ -86,6 +87,10 @@ type ScanRecord struct {
 	Reason                string       `json:"reason,omitempty"`
 	Values                []meta.Entry `json:"values,omitempty"`
 	ChangedSinceDiscovery bool         `json:"changed_since_discovery,omitempty"`
+	// Index is the candidate index this record came from. It is the
+	// watermark a resume uses to rebuild the checkpoint when a crash
+	// lost the checkpoint save of the batch that committed the record.
+	Index int `json:"index"`
 }
 
 type SearchMetadataOut struct {
@@ -172,6 +177,11 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 		out.Errors = append(out.Errors, ToolError{Code: code, Message: msg})
 		return errResult(), out, nil
 	}
+	// Serialize batches of one scan: a concurrent resume waits for the
+	// running batch, then continues from its committed checkpoint.
+	lock := a.scanLock(in.ResumeToken)
+	lock.Lock()
+	defer lock.Unlock()
 	job, err := a.Store.LoadScan(in.ResumeToken)
 	if err != nil {
 		return fail(storeErrorCode(err), err.Error())
@@ -180,8 +190,16 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 	if err != nil {
 		return fail(storeErrorCode(err), err.Error())
 	}
-	if resultMeta.TotalRecords != job.CommittedRecords {
+	if resultMeta.TotalRecords < job.CommittedRecords {
 		return fail("CHECKPOINT_CORRUPT", "stored records do not match the scan checkpoint; the scan cannot be resumed safely")
+	}
+	if resultMeta.TotalRecords > job.CommittedRecords {
+		// Records were committed but the checkpoint save was lost
+		// (crash between the two writes). The committed records are
+		// the ground truth; rebuild the checkpoint from them.
+		if err := a.recoverCheckpoint(job, resultMeta.TotalRecords); err != nil {
+			return fail("CHECKPOINT_CORRUPT", err.Error())
+		}
 	}
 	var node query.Node
 	if err := json.Unmarshal(job.QueryJSON, &node); err != nil {
@@ -206,6 +224,83 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 	return a.runSearchBatch(ctx, in, job, prepared, spec, out)
 }
 
+// maxStoredScanErrors caps how many per-file error details a
+// checkpoint persists; the exact total always remains in
+// ScanJob.Errors.
+const maxStoredScanErrors = 200
+
+// addScanError records a per-file error in the checkpoint so it is
+// still reported by later resumes.
+func addScanError(job *store.ScanJob, code, message, path string) {
+	if len(job.ErrorDetails) >= maxStoredScanErrors {
+		return
+	}
+	job.ErrorDetails = append(job.ErrorDetails, store.ScanError{Code: code, Message: message, Path: path})
+}
+
+// recoverCheckpoint rebuilds a checkpoint whose last batch committed
+// its records but whose checkpoint save was lost to a crash. The
+// committed records are the ground truth: each carries its candidate
+// index, so the scan position is the index after the last committed
+// record (any no-match tail of the crashed batch is simply
+// reprocessed — it produced no records, so nothing can duplicate).
+func (a *App) recoverCheckpoint(job *store.ScanJob, totalRecords int) error {
+	matched, indet := 0, 0
+	lastIndex := -1
+	for offset := 0; offset < totalRecords; {
+		_, page, err := a.Store.RecordsPage(job.ResultID, offset, 1000, 0)
+		if err != nil {
+			return err
+		}
+		for i, raw := range page.Records {
+			var rec struct {
+				Index  *int   `json:"index"`
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				return err
+			}
+			switch rec.Status {
+			case "match":
+				matched++
+			case "indeterminate":
+				indet++
+			}
+			if offset+i >= job.CommittedRecords {
+				// Records past the checkpoint must carry their
+				// candidate index; without it the scan position
+				// cannot be rebuilt safely.
+				if rec.Index == nil {
+					return fmt.Errorf("committed record %d has no candidate index; cannot recover checkpoint", offset+i)
+				}
+				if *rec.Index > lastIndex {
+					lastIndex = *rec.Index
+				}
+			}
+		}
+		offset = page.NextOffset
+		if !page.HasMore {
+			break
+		}
+	}
+	job.CommittedRecords = totalRecords
+	if lastIndex+1 > job.NextIndex {
+		job.NextIndex = lastIndex + 1
+	}
+	// Every processed candidate advanced NextIndex exactly once, and
+	// the match/indeterminate totals are exact in the records. The
+	// crashed batch's per-file errors were never persisted, so their
+	// residual lands in NoMatch; the record data itself is exact.
+	job.Processed = job.NextIndex
+	job.Matched = matched
+	job.Indet = indet
+	job.NoMatch = job.Processed - job.Matched - job.Indet - job.Errors
+	if job.NoMatch < 0 {
+		job.NoMatch = 0
+	}
+	return a.Store.SaveScan(job)
+}
+
 // runSearchBatch evaluates one bounded batch of the scan and commits it.
 func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *store.ScanJob, prepared *query.Prepared, spec meta.ReadSpec, out SearchMetadataOut) (*mcp.CallToolResult, SearchMetadataOut, error) {
 	fail := func(code, msg string) (*mcp.CallToolResult, SearchMetadataOut, error) {
@@ -224,13 +319,19 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 		}
 	}
 	remaining := len(job.Candidates) - job.NextIndex
-	if remaining > 0 && budget > remaining {
+	if remaining <= 0 {
+		// Already fully scanned (e.g. a repeated resume of a
+		// completed scan): report completion instead of slicing
+		// past the candidate list.
+		budget = 0
+	} else if budget > remaining {
 		budget = remaining
 	}
 	var callRecords []ScanRecord
 	if budget > 0 {
 		batchCtx, cancel := context.WithTimeout(ctx, batchTime)
 		defer cancel()
+		batchStart := job.NextIndex
 		batch := job.Candidates[job.NextIndex : job.NextIndex+budget]
 		files := make([]string, len(batch))
 		changed := make([]bool, len(batch))
@@ -242,7 +343,7 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 				job.Errors++
 				job.Processed++
 				job.NextIndex++
-				out.Errors = append(out.Errors, ToolError{Code: "PATH_NOT_FOUND", Message: err.Error(), Path: c.Path})
+				addScanError(job, "PATH_NOT_FOUND", err.Error(), c.Path)
 				continue
 			}
 			if fi.Size() != c.Size || !fi.ModTime().Equal(c.ModTime) {
@@ -267,7 +368,7 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 				job.NextIndex++
 				if fr.Status == "error" {
 					job.Errors++
-					out.Errors = append(out.Errors, ToolError{Code: "EXTRACTION_FAILED", Message: fr.Error, Path: fr.Path})
+					addScanError(job, "EXTRACTION_FAILED", fr.Error, fr.Path)
 					continue
 				}
 				tri, reason := prepared.Eval(fr.Entries)
@@ -278,6 +379,7 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 						Path: fr.Path, Status: "match",
 						Values:                filterEntries(fr.Entries, job.ReturnTags),
 						ChangedSinceDiscovery: changed[i],
+						Index:                 batchStart + i,
 					})
 				case query.Indeterminate:
 					job.Indet++
@@ -285,6 +387,7 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 						Path: fr.Path, Status: "indeterminate", Reason: reason,
 						Values:                filterEntries(fr.Entries, job.ReturnTags),
 						ChangedSinceDiscovery: changed[i],
+						Index:                 batchStart + i,
 					})
 				default:
 					job.NoMatch++
@@ -329,6 +432,12 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 		out.Status = "partial"
 	} else if job.Errors > 0 {
 		out.Status = "partial"
+	}
+	// Report the scan's accumulated per-file errors (persisted in the
+	// checkpoint, so they survive restarts) after any errors this call
+	// collected before the batch ran (e.g. enumeration errors).
+	for _, e := range job.ErrorDetails {
+		out.Errors = append(out.Errors, ToolError{Code: e.Code, Message: e.Message, Path: e.Path})
 	}
 	return okResult(false), out, nil
 }

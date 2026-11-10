@@ -29,6 +29,18 @@ type App struct {
 	catMu  sync.Mutex
 	cat    *catalog.Catalog
 	catKey string
+
+	// scanLocks holds one mutex per scan id so that only one batch of
+	// a given scan runs at a time; a concurrent resume waits and then
+	// continues from the updated checkpoint instead of reprocessing
+	// the same batch and duplicating records.
+	scanLocks sync.Map // scan id -> *sync.Mutex
+}
+
+// scanLock returns the mutex guarding the scan with the given id.
+func (a *App) scanLock(id string) *sync.Mutex {
+	m, _ := a.scanLocks.LoadOrStore(id, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 // ToolError is a structured error entry in tool output.

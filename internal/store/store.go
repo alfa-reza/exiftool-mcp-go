@@ -86,8 +86,11 @@ type ScanJob struct {
 	NextIndex   int              `json:"next_index"`
 	// CommittedRecords is the number of result records written by
 	// committed batches. On resume it is reconciled with the result
-	// store: a mismatch means a crash mid-commit and is reported as
-	// CHECKPOINT_CORRUPT instead of silently duplicating records.
+	// store. Records ahead of the checkpoint mean a crash between
+	// appending a batch and saving the checkpoint; that state is
+	// recoverable from the records themselves (each carries its
+	// candidate index) and is rebuilt, never silently duplicated.
+	// Fewer records than the checkpoint claims is genuine corruption.
 	CommittedRecords int  `json:"committed_records"`
 	Processed        int  `json:"processed"`
 	Matched          int  `json:"matched"`
@@ -95,6 +98,17 @@ type ScanJob struct {
 	Indet            int  `json:"indeterminate"`
 	Errors           int  `json:"errors"`
 	Done             bool `json:"done"`
+	// ErrorDetails persists the per-file errors of all batches (the
+	// exact total is Errors; details are capped by the tools layer),
+	// so a resumed scan still reports why earlier files failed.
+	ErrorDetails []ScanError `json:"error_details,omitempty"`
+}
+
+// ScanError is one persisted per-file scan error.
+type ScanError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Path    string `json:"path,omitempty"`
 }
 
 // Store is a disk-backed result store.

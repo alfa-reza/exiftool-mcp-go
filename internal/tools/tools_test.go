@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -338,6 +339,129 @@ func TestSearchResumeKeepsTimeContext(t *testing.T) {
 	}
 	if !out2.ScanComplete || out2.NoMatchCount != 2 || out2.IndeterminateCount != 0 {
 		t.Fatalf("resume lost the stored time_context: %+v", out2)
+	}
+}
+
+func TestSearchResumeAfterCrashWindow(t *testing.T) {
+	// Simulate a crash between committing a batch's records and
+	// saving its checkpoint: the records stay, the checkpoint is
+	// rewound to the pre-batch state. Resume must recover from the
+	// committed records — not fail with CHECKPOINT_CORRUPT and not
+	// duplicate any record.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir},
+		Query:       q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out1.MatchedCount != 2 || out1.ResumeToken == "" {
+		t.Fatalf("first batch wrong: %+v", out1)
+	}
+	// Rewind the checkpoint to before the batch; the committed
+	// records (2 matches) remain in the result store.
+	job, err := app1.Store.LoadScan(out1.ResumeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.CommittedRecords, job.NextIndex, job.Processed = 0, 0, 0
+	job.Matched, job.NoMatch, job.Indet, job.Errors = 0, 0, 0, 0
+	job.ErrorDetails = nil
+	if err := app1.Store.SaveScan(job); err != nil {
+		t.Fatal(err)
+	}
+	// Resume after a restart: recovery rebuilds the checkpoint.
+	app2, _ := newTestApp(t, storeDir)
+	_, out2, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{ResumeToken: out1.ResumeToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Status == "failed" {
+		t.Fatalf("resume after crash window failed: %+v", out2.Errors)
+	}
+	if !out2.ScanComplete || out2.ScannedCount != 4 {
+		t.Fatalf("scan did not complete after recovery: %+v", out2)
+	}
+	if out2.MatchedCount != 2 || out2.NoMatchCount != 1 || out2.ErrorCount != 1 {
+		t.Fatalf("counts after recovery wrong: %+v", out2)
+	}
+	_, page, err := app2.getResultPage(ctx, nil, GetResultPageIn{ResultID: out2.ResultID, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("expected exactly 2 stored records (no duplicates), got %d", len(page.Items))
+	}
+	// The corrupt file's error, recorded by the post-recovery batch,
+	// is part of the persisted error history.
+	foundErr := false
+	for _, e := range out2.Errors {
+		if e.Code == "EXTRACTION_FAILED" {
+			foundErr = true
+		}
+	}
+	if !foundErr {
+		t.Fatalf("expected persisted EXTRACTION_FAILED error, got %+v", out2.Errors)
+	}
+}
+
+func TestSearchConcurrentResume(t *testing.T) {
+	// Two resumes of the same token at the same time must serialize:
+	// both succeed, and the scan's records are written exactly once.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+
+	app, _ := newTestApp(t, storeDir)
+	_, out1, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir},
+		Query:       q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := out1.ResumeToken
+	if token == "" {
+		t.Fatalf("expected a resume token: %+v", out1)
+	}
+	var wg sync.WaitGroup
+	outs := make([]SearchMetadataOut, 2)
+	errs := make([]error, 2)
+	for k := 0; k < 2; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			_, o, e := app.searchMetadata(ctx, nil, SearchMetadataIn{ResumeToken: token})
+			outs[k], errs[k] = o, e
+		}(k)
+	}
+	wg.Wait()
+	for k := range errs {
+		if errs[k] != nil {
+			t.Fatal(errs[k])
+		}
+		if outs[k].Status == "failed" {
+			t.Fatalf("concurrent resume %d failed: %+v", k, outs[k].Errors)
+		}
+		if !outs[k].ScanComplete || outs[k].MatchedCount != 2 {
+			t.Fatalf("concurrent resume %d wrong totals: %+v", k, outs[k])
+		}
+	}
+	_, page, err := app.getResultPage(ctx, nil, GetResultPageIn{ResultID: out1.ResultID, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("expected exactly 2 stored records, got %d", len(page.Items))
 	}
 }
 
