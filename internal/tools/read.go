@@ -191,7 +191,9 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 	}
 	out.Items = pageItems
 	if stored != nil {
-		_ = a.Store.MarkComplete(stored.ID)
+		if err := a.Store.MarkComplete(stored.ID); err != nil {
+			return failWith(storeErrorCode(err), err.Error())
+		}
 		out.ResultID = stored.ID
 		out.NextCursor = encodeCursor(len(pageItems))
 		out.HasMore = true

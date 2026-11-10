@@ -775,13 +775,13 @@ func TestFastLevelGuardForConclusions(t *testing.T) {
 	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
 	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
 		Paths: []string{dir}, Query: q,
-		ReadOptions: &ReadOptionsInput{FastScanLevel: 2},
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
-		t.Fatalf("search with fast_scan_level 2 must be rejected, got %+v", out)
+		t.Fatalf("search with fast_scan_level 1 must be rejected, got %+v", out)
 	}
 	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
 		LeftPath: a, RightPath: a,
@@ -1454,5 +1454,29 @@ func TestSearchErrorCountIncludesEnumErrors(t *testing.T) {
 	// path fails enumeration (1): error_count must report both.
 	if out.ErrorCount != 2 {
 		t.Fatalf("error_count = %d, want 2 (extraction + enumeration): %+v", out.ErrorCount, out)
+	}
+}
+
+func TestSearchSameDocumentGetsProvenance(t *testing.T) {
+	// A same_document query must receive document identity even
+	// when the caller did not ask for embedded extraction: the
+	// search wires family 3 into the read on its own, so verdicts
+	// over an ordinary JPEG are determinate instead of permanently
+	// indeterminate.
+	requireExifTool(t)
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "all", Scope: "same_document", Children: []*query.Node{
+		{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"},
+		{Type: "predicate", Tag: "ISO", Operator: "eq", Value: 3200},
+	}}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.MatchedCount != 1 || out.IndeterminateCount != 0 {
+		t.Fatalf("same_document over plain files should match a.jpg determinately: %+v", out)
 	}
 }

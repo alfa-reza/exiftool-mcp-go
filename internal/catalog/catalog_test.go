@@ -88,3 +88,20 @@ func TestLoadPropagatesListingFailures(t *testing.T) {
 		}
 	}
 }
+
+type exitRunner struct{}
+
+func (exitRunner) Run(_ context.Context, args ...string) (runner.Result, error) {
+	return runner.Result{ExitCode: 1, Stderr: "simulated listing failure"}, nil
+}
+
+func (exitRunner) Path() string       { return "fake" }
+func (exitRunner) ConfigMode() string { return "standard" }
+
+func TestCatalogLoadRejectsNonzeroExit(t *testing.T) {
+	// A listing command that exits nonzero yields no listing at
+	// all: the failure must surface instead of an empty catalog.
+	if _, err := Load(context.Background(), exitRunner{}); err == nil {
+		t.Fatal("Load must fail when a listing command exits nonzero")
+	}
+}

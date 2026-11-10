@@ -66,6 +66,7 @@ func TestSpecArgs(t *testing.T) {
 		{ReadSpec{EmbeddedLevel: 1}, "-G0:1:3"},
 		{ReadSpec{IncludeDuplicates: true}, "-G0:1:4"},
 		{ReadSpec{EmbeddedLevel: 2, IncludeDuplicates: true}, "-G0:1:3:4"},
+		{ReadSpec{DocProvenance: true}, "-G0:1:3"},
 	} {
 		joined := strings.Join(tc.spec.Args(), " ")
 		if !strings.Contains(joined, tc.want) || strings.Count(joined, "-G") != 1 {

@@ -461,3 +461,36 @@ func TestScanLockReleaseRespectsOwnership(t *testing.T) {
 		t.Fatalf("lock file should be gone after the owner releases (stat err = %v)", err)
 	}
 }
+
+func TestQuotaCountsMetadata(t *testing.T) {
+	// meta.json is store data too: a quota sized for the payload
+	// alone must reject the write instead of being overrun by the
+	// metadata written alongside it.
+	st, err := New(t.TempDir(), time.Hour, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveText(strings.Repeat("x", 110)); !errors.Is(err, ErrFull) {
+		t.Fatalf("SaveText(110B) at quota 128: err = %v, want ErrFull", err)
+	}
+	// CreateResult writes only a meta.json; even that must respect
+	// the quota.
+	st2, err := New(t.TempDir(), time.Hour, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st2.CreateResult(KindRecords); !errors.Is(err, ErrFull) {
+		t.Fatalf("CreateResult at quota 1: err = %v, want ErrFull", err)
+	}
+	// Successful writes stay within the quota afterwards.
+	st3, err := New(t.TempDir(), time.Hour, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st3.SaveText("hello"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st3.TotalBytes(); got > 4096 {
+		t.Fatalf("TotalBytes after small write = %d, over the 4096 quota", got)
+	}
+}

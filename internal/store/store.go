@@ -184,6 +184,18 @@ func (s *Store) saveMeta(m *ResultMeta) error {
 	return writeAtomic(filepath.Join(s.resultDir(m.ID), "meta.json"), data)
 }
 
+// metaBytes returns the size of the meta.json a result occupies,
+// so capacity checks count the metadata alongside the payload
+// instead of discovering the overrun only afterwards, when
+// TotalBytes walks the written files.
+func metaBytes(m *ResultMeta) int64 {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return 0
+	}
+	return int64(len(data))
+}
+
 // LoadMeta reads and validates a result's metadata.
 func (s *Store) LoadMeta(id string) (*ResultMeta, error) {
 	if !validID(id) {
@@ -252,10 +264,20 @@ func recordsBytes(records []json.RawMessage) int64 {
 func (s *Store) SaveRecords(records []json.RawMessage) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureCapacity(recordsBytes(records)); err != nil {
+	m := s.newMeta(KindRecords)
+	add := recordsBytes(records)
+	if len(records) > 0 {
+		// appendSegment will reference exactly one segment; measure
+		// the meta in the state saveMeta will persist.
+		sim := *m
+		sim.Segments = []Segment{{File: "seg-000001.jsonl", Records: len(records), Bytes: recordsBytes(records)}}
+		sim.TotalRecords = len(records)
+		sim.TotalBytes = recordsBytes(records)
+		add += metaBytes(&sim)
+	}
+	if err := s.ensureCapacity(add); err != nil {
 		return nil, err
 	}
-	m := s.newMeta(KindRecords)
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
 	}
@@ -271,8 +293,15 @@ func (s *Store) SaveRecords(records []json.RawMessage) (*ResultMeta, error) {
 // CreateResult creates an empty, incomplete result (used by scans that
 // append committed batches over time).
 func (s *Store) CreateResult(kind Kind) (*ResultMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	m := s.newMeta(kind)
 	m.Complete = false
+	// Even an empty result occupies its meta.json; the quota
+	// applies to it like to any other store data.
+	if err := s.ensureCapacity(metaBytes(m)); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
 	}
@@ -310,11 +339,21 @@ func (s *Store) appendSegment(m *ResultMeta, records []json.RawMessage) (string,
 func (s *Store) AppendRecords(id string, records []json.RawMessage) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureCapacity(recordsBytes(records)); err != nil {
-		return nil, err
-	}
 	m, err := s.LoadMeta(id)
 	if err != nil {
+		return nil, err
+	}
+	add := recordsBytes(records)
+	if len(records) > 0 {
+		// The meta grows by one segment entry; count the growth.
+		sim := *m
+		sim.Segments = append(append([]Segment{}, m.Segments...),
+			Segment{File: fmt.Sprintf("seg-%06d.jsonl", len(m.Segments)+1), Records: len(records), Bytes: recordsBytes(records)})
+		sim.TotalRecords = m.TotalRecords + len(records)
+		sim.TotalBytes = m.TotalBytes + recordsBytes(records)
+		add += metaBytes(&sim) - metaBytes(m)
+	}
+	if err := s.ensureCapacity(add); err != nil {
 		return nil, err
 	}
 	if _, err := s.appendSegment(m, records); err != nil {
@@ -413,17 +452,17 @@ func (s *Store) MarkComplete(id string) error {
 func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureCapacity(int64(len(data))); err != nil {
-		return nil, err
-	}
 	m := s.newMeta(KindBinary)
-	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
-		return nil, err
-	}
 	sum := sha256.Sum256(data)
 	m.SHA256 = hex.EncodeToString(sum[:])
 	m.MIME = mime
 	m.TotalBytes = int64(len(data))
+	if err := s.ensureCapacity(int64(len(data)) + metaBytes(m)); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
+		return nil, err
+	}
 	if err := writeAtomic(filepath.Join(s.resultDir(m.ID), "blob.bin"), data); err != nil {
 		return nil, err
 	}
@@ -437,16 +476,16 @@ func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 func (s *Store) SaveText(text string) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureCapacity(int64(len(text))); err != nil {
-		return nil, err
-	}
 	m := s.newMeta(KindText)
-	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
-		return nil, err
-	}
 	sum := sha256.Sum256([]byte(text))
 	m.SHA256 = hex.EncodeToString(sum[:])
 	m.TotalBytes = int64(len(text))
+	if err := s.ensureCapacity(int64(len(text)) + metaBytes(m)); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
+		return nil, err
+	}
 	if err := writeAtomic(filepath.Join(s.resultDir(m.ID), "text.txt"), []byte(text)); err != nil {
 		return nil, err
 	}

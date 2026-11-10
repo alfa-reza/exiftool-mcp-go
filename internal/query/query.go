@@ -300,6 +300,31 @@ func (p *Prepared) evalNode(n *pnode, entries []meta.Entry) (Tri, string) {
 	return Indeterminate, "unknown node"
 }
 
+// hasNegativeConstruct reports whether the group contains a
+// negative condition (a missing/ne/not_in predicate, or a not
+// node). Negative conditions are grouping-sensitive: a tag whose
+// presence defeats "missing" in a pooled evaluation might live in
+// a different document than the entries it is pooled with, so a
+// pooled failure can never prove that no same-document grouping
+// satisfies the group.
+func hasNegativeConstruct(n *pnode) bool {
+	if n.typ == "not" {
+		return true
+	}
+	if n.typ == "predicate" {
+		switch n.operator {
+		case "missing", "ne", "not_in":
+			return true
+		}
+	}
+	for _, c := range n.children {
+		if hasNegativeConstruct(c) {
+			return true
+		}
+	}
+	return false
+}
+
 // evalSameDocument evaluates a logic node once per document bucket and
 // matches if any single document satisfies the whole group.
 //
@@ -309,6 +334,7 @@ func (p *Prepared) evalNode(n *pnode, entries []meta.Entry) (Tri, string) {
 // would satisfy the group the verdict is indeterminate — never a
 // fabricated match.
 func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string) {
+	neg := hasNegativeConstruct(n)
 	buckets := make(map[string][]meta.Entry)
 	var order []string
 	var unknown []meta.Entry
@@ -333,6 +359,17 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 	for _, k := range order {
 		t, r := p.evalNode(&inner, buckets[k])
 		if t == Match {
+			if neg && len(unknown) > 0 {
+				// The bucket satisfies the group on its own, but an
+				// unprovenanced entry could belong to this very
+				// document and defeat a negative condition in it.
+				// The match is possible, not proven.
+				sawIndet = true
+				if reason == "" {
+					reason = "same_document cannot be proven: some entries have no document identity"
+				}
+				continue
+			}
 			return Match, ""
 		}
 		if t == Indeterminate {
@@ -342,10 +379,13 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 	}
 	if len(unknown) > 0 {
 		// Pooling is the most permissive grouping of the unprovenanced
-		// entries: if even pooled they cannot satisfy the group, no
-		// same-document grouping of them could either (definite
-		// no-match). If pooled they would match, the truth depends on
-		// provenance ExifTool did not provide.
+		// entries FOR POSITIVE CONDITIONS: if even pooled they cannot
+		// satisfy the group, no same-document grouping of them could
+		// either (definite no-match). If pooled they would match, the
+		// truth depends on provenance ExifTool did not provide. With
+		// a negative condition in the group the pooled failure proves
+		// nothing: the defeating entries could belong to a different
+		// document than the rest, so the verdict is indeterminate.
 		t, r := p.evalNode(&inner, unknown)
 		if t == Match {
 			return Indeterminate, "same_document cannot be proven: entries have no document identity"
@@ -354,6 +394,12 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 			sawIndet = true
 			if reason == "" {
 				reason = r
+			}
+		}
+		if t == NoMatch && neg {
+			sawIndet = true
+			if reason == "" {
+				reason = "same_document cannot be proven: entries have no document identity"
 			}
 		}
 		// The mixed case: a leg with known provenance and a leg
@@ -375,6 +421,15 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 				sawIndet = true
 				if reason == "" {
 					reason = r
+				}
+			}
+			if t == NoMatch && neg {
+				// The unprovenanced entries defeating a negative
+				// condition here might not belong to this bucket
+				// at all; the failure is unprovable, not definite.
+				sawIndet = true
+				if reason == "" {
+					reason = "same_document cannot be proven: some entries have no document identity"
 				}
 			}
 		}

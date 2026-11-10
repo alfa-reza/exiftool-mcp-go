@@ -320,3 +320,52 @@ func TestStringIdentifiersCompareAsText(t *testing.T) {
 		t.Fatalf("SerialNumber eq \"123\" with value_type=number = %v, want match", got)
 	}
 }
+
+func TestSameDocumentNegativeNeedsProvenance(t *testing.T) {
+	// No provenance at all, and the group fails only because ISO is
+	// present in the pool: Make and ISO could live in different
+	// documents, and the Make document would satisfy the group.
+	// no_match is unprovable — the verdict is indeterminate.
+	es := entries("EXIF:Make", "Canon", "EXIF:ISO", 100)
+	n := &Node{Type: "all", Scope: "same_document", Children: []*Node{
+		{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"},
+		{Type: "predicate", Tag: "ISO", Operator: "missing"},
+	}}
+	if got := eval(t, n, nil, es); got != Indeterminate {
+		t.Fatalf("same_document negative without provenance = %v, want indeterminate", got)
+	}
+	// A POSITIVE failure stays a definite no_match: no grouping of
+	// these entries can produce a Nikon Make.
+	n2 := &Node{Type: "all", Scope: "same_document", Children: []*Node{
+		{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Nikon"},
+		{Type: "predicate", Tag: "ISO", Operator: "eq", Value: 100},
+	}}
+	if got := eval(t, n2, nil, es); got != NoMatch {
+		t.Fatalf("same_document positive failure = %v, want no_match", got)
+	}
+	// Mixed provenance: the known bucket fails only because the
+	// unprovenanced ISO entry was joined into it — the entry might
+	// belong to another document, so this is indeterminate too.
+	esMixed := entries("Doc1:EXIF:Make", "Canon", "EXIF:ISO", 100)
+	if got := eval(t, n, nil, esMixed); got != Indeterminate {
+		t.Fatalf("same_document negative with mixed provenance = %v, want indeterminate", got)
+	}
+}
+
+func TestDateLikeIdentifiersCompareAsText(t *testing.T) {
+	// Two strings that merely parse as datetimes compare as text
+	// for equality: "2026-11-10" is not the same identifier as
+	// "2026:11:10". Datetime equality needs an explicit value_type.
+	es := entries("EXIF:SerialNumber", "2026-11-10")
+	if got := eval(t, pred("SerialNumber", "eq", "2026:11:10"), nil, es); got != NoMatch {
+		t.Fatalf("SerialNumber eq \"2026:11:10\" = %v, want no_match", got)
+	}
+	if got := eval(t, pred("SerialNumber", "eq", "2026-11-10"), nil, es); got != Match {
+		t.Fatalf("SerialNumber eq \"2026-11-10\" = %v, want match", got)
+	}
+	n := pred("SerialNumber", "eq", "2026:11:10")
+	n.ValueType = "datetime"
+	if got := eval(t, n, nil, es); got != Match {
+		t.Fatalf("SerialNumber eq with value_type=datetime = %v, want match", got)
+	}
+}

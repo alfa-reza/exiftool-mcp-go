@@ -15,6 +15,7 @@ type ReadSpec struct {
 	IncludeDuplicates  bool     // -a
 	UnknownTags        int      // 0=off, 1=-u, 2=-U
 	EmbeddedLevel      int      // 0=off, 1=-ee, 2=-ee2, 3=-ee3
+	DocProvenance      bool     // request family 3 (document identity) without -ee
 	NumericValues      bool     // -n
 	PreserveStructures bool     // -struct
 	FastScanLevel      int      // 0=off, 1=-fast, 2..5=-fast2..-fast5
@@ -91,8 +92,12 @@ func (s ReadSpec) Args() []string {
 	// embedded reads (verified against ExifTool 13.55; the combined
 	// form yields EXIF:IFD0:Main:Make and File:Main:Copy1:Comment).
 	families := []string{"0", "1"}
-	if s.EmbeddedLevel > 0 {
-		// Document/instance families only appear for embedded content.
+	if s.EmbeddedLevel > 0 || s.DocProvenance {
+		// Family 3 carries document identity (Main for the main
+		// document). Embedded extraction implies it, but provenance
+		// can also be requested on its own — same_document queries
+		// need it to reach determinate verdicts, without forcing
+		// -ee extraction the caller did not ask for.
 		families = append(families, "3")
 	}
 	if s.IncludeDuplicates {
@@ -150,6 +155,7 @@ func (s ReadSpec) Describe() map[string]any {
 		"include_duplicates":  s.IncludeDuplicates,
 		"unknown_tags":        s.UnknownTags,
 		"embedded_level":      s.EmbeddedLevel,
+		"doc_provenance":      s.DocProvenance,
 		"numeric_values":      s.NumericValues,
 		"preserve_structures": s.PreserveStructures,
 		"fast_scan_level":     s.FastScanLevel,
