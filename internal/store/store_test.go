@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -109,14 +111,26 @@ func TestQuotaEnforcedOnSave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveBlob(make([]byte, 600), "application/octet-stream"); err != nil {
+	first, err := s.SaveBlob(make([]byte, 600), "application/octet-stream")
+	if err != nil {
 		t.Fatalf("first blob should fit: %v", err)
 	}
-	if _, err := s.SaveBlob(make([]byte, 600), "application/octet-stream"); !errors.Is(err, ErrFull) {
-		t.Fatalf("second blob should exceed the quota: %v", err)
+	// A second write that does not fit alongside the first evicts
+	// the completed first result to make room instead of failing.
+	second, err := s.SaveBlob(make([]byte, 600), "application/octet-stream")
+	if err != nil {
+		t.Fatalf("second blob should displace the first: %v", err)
 	}
-	if _, err := s.SaveText(strings.Repeat("x", 600)); !errors.Is(err, ErrFull) {
-		t.Fatalf("oversized text should exceed the quota: %v", err)
+	if _, err := s.LoadMeta(first.ID); err == nil {
+		t.Fatal("first blob should have been evicted")
+	}
+	if _, err := s.LoadMeta(second.ID); err != nil {
+		t.Fatalf("second blob should be stored: %v", err)
+	}
+	// A payload larger than the whole quota can never fit, no
+	// matter what is evicted.
+	if _, err := s.SaveText(strings.Repeat("x", 1200)); !errors.Is(err, ErrFull) {
+		t.Fatalf("payload larger than the quota should fail: %v", err)
 	}
 	if _, err := s.SaveText("tiny"); err != nil {
 		t.Fatalf("small text should still fit: %v", err)
@@ -304,5 +318,106 @@ func TestScanCheckpointRoundTrip(t *testing.T) {
 	}
 	if len(page.Records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(page.Records))
+	}
+}
+
+func TestQuotaEvictionMakesRoomForPendingWrite(t *testing.T) {
+	s, err := New(t.TempDir(), time.Hour, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := s.SaveText(strings.Repeat("x", 1500))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Usage is below the quota, but usage plus the new write is not.
+	// The completed old result must be evicted to make room instead
+	// of the write being rejected.
+	if _, err := s.SaveText(strings.Repeat("y", 1000)); err != nil {
+		t.Fatalf("write should have displaced the old completed result: %v", err)
+	}
+	if _, err := s.LoadMeta(old.ID); err == nil {
+		t.Fatal("old completed result should have been evicted")
+	}
+	if got := s.TotalBytes(); got > 2048 {
+		t.Fatalf("usage %d exceeds quota", got)
+	}
+}
+
+func TestQuotaCountsScanCheckpoints(t *testing.T) {
+	s, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &ScanJob{ResultID: strings.Repeat("a", 32)}
+	for i := 0; i < 300; i++ {
+		job.Candidates = append(job.Candidates, meta.Candidate{Path: fmt.Sprintf("/photos/some/fairly/long/path/photo-%04d.jpg", i)})
+	}
+	if err := s.CreateScan(job); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(s.scanPath(job.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() < 30000 {
+		t.Fatalf("fixture too small: %d bytes", fi.Size())
+	}
+	if got := s.TotalBytes(); got < fi.Size() {
+		t.Fatalf("TotalBytes %d does not include the %d-byte checkpoint", got, fi.Size())
+	}
+}
+
+func TestConcurrentWritesRespectQuota(t *testing.T) {
+	s, err := New(t.TempDir(), time.Hour, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := strings.Repeat("z", 8<<10)
+	var wg sync.WaitGroup
+	errs := make([]error, 16)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = s.SaveText(payload)
+		}(i)
+	}
+	wg.Wait()
+	succeeded := 0
+	for _, err := range errs {
+		if err == nil {
+			succeeded++
+		} else if !errors.Is(err, ErrFull) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if succeeded == 0 {
+		t.Fatal("at least one write must fit")
+	}
+	if got := s.TotalBytes(); got > 64<<10 {
+		t.Fatalf("concurrent writes overshot the quota: %d bytes", got)
+	}
+}
+
+func TestFragmentAtEOFCompletesRune(t *testing.T) {
+	s := newStore(t)
+	m, err := s.SaveText("é")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 1-byte budget cuts the 2-byte rune; the fragment must still
+	// return the whole rune and advance. The completion read hits
+	// EOF here, which used to discard the bytes it did read and
+	// stall paging forever.
+	_, chunk, next, err := s.Fragment(m.ID, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(chunk) != "é" || next != 2 {
+		t.Fatalf("fragment = %q next %d, want %q next 2", chunk, next, "é")
+	}
+	if !utf8.Valid(chunk) {
+		t.Fatal("fragment is not valid UTF-8")
 	}
 }

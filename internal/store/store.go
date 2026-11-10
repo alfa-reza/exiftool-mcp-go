@@ -203,11 +203,15 @@ func (s *Store) newMeta(kind Kind) *ResultMeta {
 	}
 }
 
-// ensureCapacity guarantees room for add more bytes of result data.
-// When the projected usage exceeds the quota it first runs a cleanup
-// (expired entries, then oldest completed results) — this is also
-// what enforces the quota while the server keeps running, not only
-// at startup. If the data still does not fit, ErrFull is returned.
+// ensureCapacity guarantees room for add more bytes of store data.
+// The caller must hold s.mu: the capacity check and the write it
+// guards have to be one atomic step, or concurrent writers can each
+// pass the check and overshoot the quota together. When the
+// projected usage exceeds the quota it runs a cleanup that evicts
+// completed results until the pending write fits — eviction is
+// driven by the size of the write that needs room, not only by
+// usage already over the limit. If the data still does not fit,
+// ErrFull is returned.
 func (s *Store) ensureCapacity(add int64) error {
 	if s.quota <= 0 || add <= 0 {
 		return nil
@@ -215,7 +219,7 @@ func (s *Store) ensureCapacity(add int64) error {
 	if s.TotalBytes()+add <= s.quota {
 		return nil
 	}
-	_, _ = s.Cleanup()
+	_, _ = s.cleanup(add)
 	if s.TotalBytes()+add > s.quota {
 		return fmt.Errorf("%w: %d bytes do not fit in the %d-byte quota", ErrFull, add, s.quota)
 	}
@@ -232,6 +236,8 @@ func recordsBytes(records []json.RawMessage) int64 {
 
 // SaveRecords stores a complete list of JSON records.
 func (s *Store) SaveRecords(records []json.RawMessage) (*ResultMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.ensureCapacity(recordsBytes(records)); err != nil {
 		return nil, err
 	}
@@ -320,6 +326,8 @@ func (s *Store) MarkComplete(id string) error {
 
 // SaveBlob stores a binary payload.
 func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.ensureCapacity(int64(len(data))); err != nil {
 		return nil, err
 	}
@@ -342,6 +350,8 @@ func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 
 // SaveText stores a text payload.
 func (s *Store) SaveText(text string) (*ResultMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.ensureCapacity(int64(len(text))); err != nil {
 		return nil, err
 	}
@@ -468,11 +478,18 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 		if len(chunk) == 0 && n > 0 {
 			// The byte budget is smaller than the next code point.
 			// Return the complete code point anyway so the cursor
-			// always advances and paging can never stall.
+			// always advances and paging can never stall. ReadAt
+			// reports io.EOF when the code point ends the payload;
+			// the bytes it did read are the ones that matter, so
+			// the error must not discard them.
 			ext := make([]byte, 4)
-			if _, err := f.ReadAt(ext, offset); err == nil {
-				if _, size := utf8.DecodeRune(ext); size > 0 {
+			if rn, _ := f.ReadAt(ext, offset); rn > 0 {
+				if _, size := utf8.DecodeRune(ext[:rn]); size > 0 && size <= rn {
 					chunk = ext[:size]
+				} else {
+					// The payload itself ends mid-rune (corrupt);
+					// return one byte so the cursor still advances.
+					chunk = ext[:1]
 				}
 			}
 		}
@@ -527,11 +544,25 @@ func (s *Store) CreateScan(job *ScanJob) error {
 	return s.SaveScan(job)
 }
 
-// SaveScan atomically persists a scan job checkpoint.
+// SaveScan atomically persists a scan job checkpoint. Checkpoints
+// count toward the store quota like any other payload; only the
+// growth over the previous checkpoint is charged, so re-saving a
+// same-size checkpoint never fails on its own bytes.
 func (s *Store) SaveScan(job *ScanJob) error {
 	data, err := json.Marshal(job)
 	if err != nil {
 		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var existing int64
+	if fi, err := os.Stat(s.scanPath(job.ID)); err == nil {
+		existing = fi.Size()
+	}
+	if growth := int64(len(data)) - existing; growth > 0 {
+		if err := s.ensureCapacity(growth); err != nil {
+			return err
+		}
 	}
 	return writeAtomic(s.scanPath(job.ID), data)
 }
@@ -559,19 +590,30 @@ func (s *Store) LoadScan(id string) (*ScanJob, error) {
 }
 
 // Cleanup removes expired results and scans, then enforces the disk
-// quota by deleting the oldest completed results first. It returns the
-// number of removed entries.
+// quota by deleting the oldest completed results first. It returns
+// the number of removed entries.
 func (s *Store) Cleanup() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cleanup(0)
+}
+
+// cleanup is Cleanup with a reservation: eviction frees enough room
+// for need additional bytes, not merely enough to get back under
+// the quota — a write that arrives while usage sits just below the
+// limit must still be able to displace old completed results. Only
+// completed results are eviction candidates; incomplete ones belong
+// to work in flight and leave through expiry. The caller must hold
+// s.mu.
+func (s *Store) cleanup(need int64) (int, error) {
 	removed := 0
 	now := s.now()
 	type aged struct {
 		id      string
 		created time.Time
 		size    int64
-		done    bool
 	}
 	var results []aged
-	var total int64
 	entries, _ := os.ReadDir(filepath.Join(s.dir, "results"))
 	for _, e := range entries {
 		if !e.IsDir() || !validID(e.Name()) {
@@ -603,8 +645,9 @@ func (s *Store) Cleanup() (int, error) {
 			}
 			return nil
 		})
-		results = append(results, aged{id: e.Name(), created: m.CreatedAt, size: sz, done: m.Complete})
-		total += sz
+		if m.Complete {
+			results = append(results, aged{id: e.Name(), created: m.CreatedAt, size: sz})
+		}
 	}
 	scans, _ := os.ReadDir(filepath.Join(s.dir, "scans"))
 	for _, e := range scans {
@@ -612,34 +655,47 @@ func (s *Store) Cleanup() (int, error) {
 			continue
 		}
 		job, err := s.loadScanIgnoringExpiry(e.Name())
-		if err != nil || now.After(job.ExpiresAt) {
+		if err != nil {
+			// A brand-new directory may belong to a CreateScan
+			// that has not written its job.json yet.
+			if info, ierr := e.Info(); ierr == nil && time.Since(info.ModTime()) < time.Minute {
+				continue
+			}
+			_ = os.RemoveAll(filepath.Join(s.dir, "scans", e.Name()))
+			removed++
+			continue
+		}
+		if now.After(job.ExpiresAt) {
 			_ = os.RemoveAll(filepath.Join(s.dir, "scans", e.Name()))
 			removed++
 		}
 	}
-	if s.quota > 0 && total > s.quota {
-		sort.Slice(results, func(i, j int) bool {
-			if results[i].done != results[j].done {
-				return results[i].done // completed first
+	if s.quota > 0 {
+		total := s.TotalBytes()
+		if total+need > s.quota {
+			sort.Slice(results, func(i, j int) bool {
+				return results[i].created.Before(results[j].created)
+			})
+			for _, r := range results {
+				if total+need <= s.quota {
+					break
+				}
+				_ = os.RemoveAll(s.resultDir(r.id))
+				total -= r.size
+				removed++
 			}
-			return results[i].created.Before(results[j].created)
-		})
-		for _, r := range results {
-			if total <= s.quota {
-				break
-			}
-			_ = os.RemoveAll(s.resultDir(r.id))
-			total -= r.size
-			removed++
 		}
 	}
 	return removed, nil
 }
 
-// TotalBytes reports the current disk usage of stored results.
+// TotalBytes reports the current disk usage of the whole store:
+// results AND scan checkpoints. Checkpoints live outside results/;
+// leaving them out let scan-heavy workloads fill the disk entirely
+// off the quota's books.
 func (s *Store) TotalBytes() int64 {
 	var total int64
-	_ = filepath.Walk(filepath.Join(s.dir, "results"), func(_ string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(s.dir, func(_ string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() {
 			total += info.Size()
 		}
