@@ -82,10 +82,27 @@ func (s ReadSpec) Validate() error {
 // Args returns the ExifTool read/output arguments for this spec
 // (excluding -config and file operands).
 func (s ReadSpec) Args() []string {
-	args := []string{"-j", "-G0:1"}
+	// Group families are requested as ONE combined -G argument
+	// (-G0:1, -G0:1:3, -G0:1:3:4). Separate -G flags do NOT combine
+	// on real ExifTool: each replaces the previous family selection,
+	// so "-G0:1 -G4" collapsed every key's group to empty and
+	// "-G0:1 -G3" replaced the groups with the document name —
+	// silently losing group identity for include_duplicates and
+	// embedded reads (verified against ExifTool 13.55; the combined
+	// form yields EXIF:IFD0:Main:Make and File:Main:Copy1:Comment).
+	families := []string{"0", "1"}
 	if s.EmbeddedLevel > 0 {
 		// Document/instance families only appear for embedded content.
-		args = append(args, "-G3")
+		families = append(families, "3")
+	}
+	if s.IncludeDuplicates {
+		// Family 4 adds the copy number so duplicate tags with the
+		// same group and name stay distinct in JSON output; with
+		// plain -a alone, ExifTool silently drops all but the first.
+		families = append(families, "4")
+	}
+	args := []string{"-j", "-G" + strings.Join(families, ":")}
+	if s.EmbeddedLevel > 0 {
 		// The documented form is -ee[NUM]: plain -ee for level 1,
 		// -ee2/-ee3 above that (not -eee/-eeee).
 		if s.EmbeddedLevel == 1 {
@@ -95,10 +112,7 @@ func (s ReadSpec) Args() []string {
 		}
 	}
 	if s.IncludeDuplicates {
-		// -G4 adds the copy number to the group so duplicate tags with
-		// the same group and name stay distinct in JSON output; with
-		// plain -a, ExifTool silently drops all but the first of them.
-		args = append(args, "-a", "-G4")
+		args = append(args, "-a")
 	}
 	switch s.UnknownTags {
 	case 1:

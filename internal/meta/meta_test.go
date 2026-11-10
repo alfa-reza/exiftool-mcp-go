@@ -51,9 +51,25 @@ func TestSpecArgs(t *testing.T) {
 	}
 	s2 := ReadSpec{IncludeDuplicates: true, UnknownTags: 2, EmbeddedLevel: 2, NumericValues: true, PreserveStructures: true, FastScanLevel: 2}
 	args2 := strings.Join(s2.Args(), " ")
-	for _, want := range []string{"-a", "-G4", "-U", "-ee2", "-G3", "-n", "-struct", "-fast2"} {
+	for _, want := range []string{"-a", "-G0:1:3:4", "-U", "-ee2", "-n", "-struct", "-fast2"} {
 		if !strings.Contains(args2, want) {
 			t.Errorf("args %q missing %q", args2, want)
+		}
+	}
+	// Group families always travel as ONE combined -G argument:
+	// separate -G flags replace each other on real ExifTool.
+	for _, tc := range []struct {
+		spec ReadSpec
+		want string
+	}{
+		{ReadSpec{}, "-G0:1"},
+		{ReadSpec{EmbeddedLevel: 1}, "-G0:1:3"},
+		{ReadSpec{IncludeDuplicates: true}, "-G0:1:4"},
+		{ReadSpec{EmbeddedLevel: 2, IncludeDuplicates: true}, "-G0:1:3:4"},
+	} {
+		joined := strings.Join(tc.spec.Args(), " ")
+		if !strings.Contains(joined, tc.want) || strings.Count(joined, "-G") != 1 {
+			t.Errorf("spec %+v: args %q, want exactly one combined %q", tc.spec, joined, tc.want)
 		}
 	}
 }

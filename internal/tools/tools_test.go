@@ -1198,3 +1198,79 @@ func TestReadOversizedValueStoreFailureIsLoud(t *testing.T) {
 		t.Fatalf("oversized value with a full store must fail as RESULT_STORE_FULL, got %+v", out)
 	}
 }
+
+func TestReaderCombinedGroupFamiliesRealExifTool(t *testing.T) {
+	// Real-binary integration for the combined -G argument: with
+	// include_duplicates (and with -ee), entries must keep their
+	// real groups. Separate -G flags made ExifTool drop them
+	// (keys came back as ":Make" / "Main:Make").
+	requireExifTool(t)
+	dir := t.TempDir()
+	// A valid JPEG carrying two COM segments (duplicate comments)
+	// plus a real Make tag.
+	p := filepath.Join(dir, "dup.jpg")
+	base := jpegBytes(t)
+	var buf []byte
+	buf = append(buf, base[:2]...)
+	for _, s := range []string{"alpha", "beta"} {
+		seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+		seg = append(seg, s...)
+		buf = append(buf, seg...)
+	}
+	buf = append(buf, base[2:]...)
+	if err := os.WriteFile(p, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli(t, "-q", "-overwrite_original", "-Make=Canon", p)
+
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	read := func(spec meta.ReadSpec) []meta.Entry {
+		res, err := app.Reader.Read(ctx, []string{p}, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Status == "error" {
+			t.Fatalf("read failed: %+v", res)
+		}
+		return res[0].Entries
+	}
+	spec := meta.ReadSpec{IncludeTags: []string{"Comment", "EXIF:Make"}, IncludeDuplicates: true}
+	entries := read(spec)
+	var comments []meta.Entry
+	groups := map[string]bool{}
+	for _, e := range entries {
+		groups[e.Name+"|"+e.Group] = true
+		if e.Name == "Comment" {
+			comments = append(comments, e)
+		}
+		if e.Name == "Make" && !strings.HasPrefix(e.Group, "EXIF") {
+			t.Errorf("Make lost its group under include_duplicates: %+v", e)
+		}
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 Comment entries, got %d (%v)", len(comments), groups)
+	}
+	copies := map[string]bool{}
+	for _, c := range comments {
+		if c.Group != "File" {
+			t.Errorf("Comment group = %q, want File", c.Group)
+		}
+		copies[c.Copy] = true
+	}
+	if !copies[""] || !copies["Copy1"] {
+		t.Errorf("duplicate copies not distinguished: %v", copies)
+	}
+	// Embedded reads keep groups AND gain document identity.
+	spec.EmbeddedLevel = 2
+	for _, e := range read(spec) {
+		if e.Name == "Make" {
+			if !strings.HasPrefix(e.Group, "EXIF") {
+				t.Errorf("Make lost its group under -ee: %+v", e)
+			}
+			if e.Document != "Main" {
+				t.Errorf("Make document = %q, want Main", e.Document)
+			}
+		}
+	}
+}
