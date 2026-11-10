@@ -14,16 +14,18 @@ type ReadSpec struct {
 	ExcludeTags        []string // selectors to exclude
 	IncludeDuplicates  bool     // -a
 	UnknownTags        int      // 0=off, 1=-u, 2=-U
-	EmbeddedLevel      int      // 0=off, 1=-ee, 2=-eee, 3=-eeee
+	EmbeddedLevel      int      // 0=off, 1=-ee, 2=-ee2, 3=-ee3
 	NumericValues      bool     // -n
 	PreserveStructures bool     // -struct
 	FastScanLevel      int      // 0=off, 1=-fast, 2..5=-fast2..-fast5
 }
 
-// selector grammar: Name | Group:Name | Group:All. Names start with a
-// letter and contain letters, digits and underscores. Anything that
-// could be confused with a CLI option or an expression is rejected.
-var selectorRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(:([A-Za-z][A-Za-z0-9_]*|All))?$`)
+// Selector grammar: Name | Group:Name | Group:All. Each segment starts
+// with a letter and contains letters, digits and underscores; a dash
+// may appear between alphanumerics so real group families such as
+// "XMP-dc" work ("XMP-dc:Title"). Anything that could be confused with
+// a CLI option or an expression is rejected.
+var selectorRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*(:([A-Za-z][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*|All))?$`)
 
 // ValidateSelector checks one agent-supplied tag/group selector.
 func ValidateSelector(sel string) error {
@@ -35,6 +37,20 @@ func ValidateSelector(sel string) error {
 	}
 	if !selectorRe.MatchString(sel) {
 		return fmt.Errorf("invalid tag selector %q", sel)
+	}
+	// An unqualified selector becomes the argv element "-" + selector.
+	// If the name is one ExifTool treats as a command-line option, the
+	// process would execute the option instead of selecting the tag,
+	// breaking the read-only boundary. Option families also take
+	// numeric parameters (-fast2, -ee3, -g4), so a name that is an
+	// option name plus trailing digits is an option too. The
+	// qualified Group:Name form can never be an option, so it stays
+	// available for such tags.
+	if !strings.Contains(sel, ":") {
+		lower := strings.ToLower(sel)
+		if exiftoolOptionNames[lower] || exiftoolOptionNames[strings.TrimRight(lower, "0123456789")] {
+			return fmt.Errorf("tag selector %q collides with an ExifTool option; use the qualified Group:Name form", sel)
+		}
 	}
 	return nil
 }
@@ -66,11 +82,34 @@ func (s ReadSpec) Validate() error {
 // Args returns the ExifTool read/output arguments for this spec
 // (excluding -config and file operands).
 func (s ReadSpec) Args() []string {
-	args := []string{"-j", "-G0:1"}
+	// Group families are requested as ONE combined -G argument
+	// (-G0:1, -G0:1:3, -G0:1:3:4). Separate -G flags do NOT combine
+	// on real ExifTool: each replaces the previous family selection,
+	// so "-G0:1 -G4" collapsed every key's group to empty and
+	// "-G0:1 -G3" replaced the groups with the document name —
+	// silently losing group identity for include_duplicates and
+	// embedded reads (verified against ExifTool 13.55; the combined
+	// form yields EXIF:IFD0:Main:Make and File:Main:Copy1:Comment).
+	families := []string{"0", "1"}
 	if s.EmbeddedLevel > 0 {
 		// Document/instance families only appear for embedded content.
-		args = append(args, "-G3")
-		args = append(args, "-"+strings.Repeat("e", s.EmbeddedLevel+1))
+		families = append(families, "3")
+	}
+	if s.IncludeDuplicates {
+		// Family 4 adds the copy number so duplicate tags with the
+		// same group and name stay distinct in JSON output; with
+		// plain -a alone, ExifTool silently drops all but the first.
+		families = append(families, "4")
+	}
+	args := []string{"-j", "-G" + strings.Join(families, ":")}
+	if s.EmbeddedLevel > 0 {
+		// The documented form is -ee[NUM]: plain -ee for level 1,
+		// -ee2/-ee3 above that (not -eee/-eeee).
+		if s.EmbeddedLevel == 1 {
+			args = append(args, "-ee")
+		} else {
+			args = append(args, fmt.Sprintf("-ee%d", s.EmbeddedLevel))
+		}
 	}
 	if s.IncludeDuplicates {
 		args = append(args, "-a")

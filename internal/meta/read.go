@@ -71,6 +71,7 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 			if p.Key == "SourceFile" {
 				if s, ok := p.Value.(string); ok {
 					bySource[s] = obj
+					bySource[pathKey(s)] = obj
 				}
 			}
 		}
@@ -85,6 +86,11 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 			}
 		}
 		if obj == nil {
+			// Slash styles differ across platforms (Windows ExifTool
+			// echoes forward slashes); correlate on the normalized form.
+			obj = bySource[pathKey(f)]
+		}
+		if obj == nil {
 			out = append(out, FileResult{Path: f, Status: "error",
 				Error: "no output from exiftool for this file"})
 			continue
@@ -95,20 +101,47 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 	return out, nil
 }
 
+// pathKey normalizes a path for correlation between requested files
+// and ExifTool's own path echo: on Windows ExifTool reports paths
+// with forward slashes while callers pass backslashes, so correlation
+// must not depend on the slash style. (filepath.ToSlash would be a
+// no-op on Unix, so the replacement is unconditional; the exact path
+// is always tried first, this is only an additional index key.)
+func pathKey(p string) string {
+	return strings.ReplaceAll(p, "\\", "/")
+}
+
 // applyStderrDiagnostics correlates stderr diagnostics with files.
 //
 // When tags are selected, ExifTool omits the Error field from the JSON
 // object of a failed file and reports "Error: <msg> - <operand>" on
 // stderr instead (verified against ExifTool 13.55). The operand is
-// echoed verbatim, so an exact suffix match is a certain correlation,
-// not a guess. Warnings are merged the same way.
+// echoed after the last " - " separator; it is matched exactly or in
+// normalized slash form (Windows echo style), never by guessing.
 func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 	if stderr == "" {
 		return
 	}
 	type diag struct{ errors, warnings []string }
 	byOperand := make(map[string]*diag)
+	// The operands as ExifTool echoes them, per requested file. A
+	// diagnostic line ends with " - <operand>"; the operand must be
+	// matched against the files actually sent, never found by
+	// splitting the line at its last " - ": a file NAME may itself
+	// contain " - " ("photo - edited.jpg"), which used to truncate
+	// the operand to "edited.jpg" and silently drop the error.
+	type operand struct{ file, text string }
+	var operands []operand
+	for _, f := range files {
+		if op, err := runner.Operand(f); err == nil {
+			operands = append(operands, operand{f, op})
+		}
+		operands = append(operands, operand{f, f})
+	}
 	for _, line := range strings.Split(stderr, "\n") {
+		// Windows child output ends lines with CRLF; a trailing \r
+		// would poison the operand comparison.
+		line = strings.TrimSuffix(line, "\r")
 		var kind, rest string
 		switch {
 		case strings.HasPrefix(line, "Error: "):
@@ -118,27 +151,29 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 		default:
 			continue
 		}
-		for _, f := range files {
-			op, err := runner.Operand(f)
-			if err != nil {
-				continue
+		// The LONGEST matching operand suffix wins, so a real path
+		// beats a shorter coincidental suffix of it.
+		best, bestLen := -1, -1
+		restKey := pathKey(rest)
+		for i, o := range operands {
+			if suffix := " - " + pathKey(o.text); strings.HasSuffix(restKey, suffix) && len(suffix) > bestLen {
+				best, bestLen = i, len(suffix)
 			}
-			suffix := " - " + op
-			if !strings.HasSuffix(rest, suffix) {
-				continue
-			}
-			msg := strings.TrimSuffix(rest, suffix)
-			d := byOperand[f]
-			if d == nil {
-				d = &diag{}
-				byOperand[f] = d
-			}
-			if kind == "error" {
-				d.errors = append(d.errors, msg)
-			} else {
-				d.warnings = append(d.warnings, msg)
-			}
-			break
+		}
+		if best < 0 {
+			continue
+		}
+		msg := rest[:len(rest)-bestLen]
+		f := operands[best].file
+		d := byOperand[f]
+		if d == nil {
+			d = &diag{}
+			byOperand[f] = d
+		}
+		if kind == "error" {
+			d.errors = append(d.errors, msg)
+		} else {
+			d.warnings = append(d.warnings, msg)
 		}
 	}
 	for i := range out {
@@ -192,6 +227,16 @@ func ParseJSONArray(data []byte) ([][]Pair, error) {
 		}
 		objects = append(objects, obj)
 	}
+	// The array must be closed. Output truncated after a complete
+	// object (a killed or output-capped ExifTool run) would otherwise
+	// parse as a successful, complete read.
+	tok, err = dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("truncated JSON array: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != ']' {
+		return nil, fmt.Errorf("expected closing ']' in JSON array")
+	}
 	return objects, nil
 }
 
@@ -231,7 +276,7 @@ func FileResultFromPairs(path string, pairs []Pair) FileResult {
 		if p.Key == "SourceFile" {
 			continue
 		}
-		_, name, _, _ := ParseKey(p.Key)
+		_, name, _, _, _ := ParseKey(p.Key)
 		if isExifToolKey(p.Key, "Error") {
 			if s, ok := p.Value.(string); ok && s != "" {
 				fr.Error = s

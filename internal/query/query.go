@@ -302,13 +302,24 @@ func (p *Prepared) evalNode(n *pnode, entries []meta.Entry) (Tri, string) {
 
 // evalSameDocument evaluates a logic node once per document bucket and
 // matches if any single document satisfies the whole group.
+//
+// A match requires provenance: entries are only grouped when ExifTool
+// gave them a document (or instance) identity. Entries without any
+// identity cannot be proven to share a document, so if pooling them
+// would satisfy the group the verdict is indeterminate — never a
+// fabricated match.
 func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string) {
 	buckets := make(map[string][]meta.Entry)
 	var order []string
+	var unknown []meta.Entry
 	for _, e := range entries {
 		k := e.Document
 		if k == "" {
 			k = e.Instance
+		}
+		if k == "" {
+			unknown = append(unknown, e)
+			continue
 		}
 		if _, ok := buckets[k]; !ok {
 			order = append(order, k)
@@ -329,6 +340,45 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 			reason = r
 		}
 	}
+	if len(unknown) > 0 {
+		// Pooling is the most permissive grouping of the unprovenanced
+		// entries: if even pooled they cannot satisfy the group, no
+		// same-document grouping of them could either (definite
+		// no-match). If pooled they would match, the truth depends on
+		// provenance ExifTool did not provide.
+		t, r := p.evalNode(&inner, unknown)
+		if t == Match {
+			return Indeterminate, "same_document cannot be proven: entries have no document identity"
+		}
+		if t == Indeterminate {
+			sawIndet = true
+			if reason == "" {
+				reason = r
+			}
+		}
+		// The mixed case: a leg with known provenance and a leg
+		// without any may still share a document — the unprovenanced
+		// entries could belong to any of the known documents.
+		// Evaluate each provenanced bucket together with the
+		// unprovenanced entries; a match there is possible but
+		// unprovable, hence indeterminate. Checking the groups only
+		// in isolation would fabricate a no_match here.
+		for _, k := range order {
+			joined := make([]meta.Entry, 0, len(buckets[k])+len(unknown))
+			joined = append(joined, buckets[k]...)
+			joined = append(joined, unknown...)
+			t, r := p.evalNode(&inner, joined)
+			if t == Match {
+				return Indeterminate, "same_document cannot be proven: some entries have no document identity"
+			}
+			if t == Indeterminate {
+				sawIndet = true
+				if reason == "" {
+					reason = r
+				}
+			}
+		}
+	}
 	if sawIndet {
 		return Indeterminate, reason
 	}
@@ -336,13 +386,17 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 }
 
 // matchesSelector reports whether an entry is selected by a tag selector
-// ("Name", "Group:Name" or "Group:All").
+// ("Name", "Group:Name" or "Group:All"). Tag and group names compare
+// case-insensitively: ExifTool itself resolves tag names without
+// regard to case, so a query for "make" must find the entry "Make" —
+// an exact-case comparison silently drops real matches. (Values are
+// unaffected; their comparison keeps the case_sensitive rule.)
 func matchesSelector(e meta.Entry, sel string) bool {
 	group, name := "", sel
 	if i := strings.Index(sel, ":"); i >= 0 {
 		group, name = sel[:i], sel[i+1:]
 	}
-	if name != "All" && e.Name != name {
+	if !strings.EqualFold(name, "All") && !strings.EqualFold(e.Name, name) {
 		return false
 	}
 	if group == "" {
@@ -353,13 +407,13 @@ func matchesSelector(e meta.Entry, sel string) bool {
 
 // groupMatches reports whether a selector group refers to an entry
 // group: it matches the full group ("EXIF:IFD0") or any single family
-// segment of it ("EXIF" or "IFD0").
+// segment of it ("EXIF" or "IFD0"), case-insensitively.
 func groupMatches(entryGroup, selGroup string) bool {
-	if entryGroup == selGroup {
+	if strings.EqualFold(entryGroup, selGroup) {
 		return true
 	}
 	for _, seg := range strings.Split(entryGroup, ":") {
-		if seg == selGroup {
+		if strings.EqualFold(seg, selGroup) {
 			return true
 		}
 	}

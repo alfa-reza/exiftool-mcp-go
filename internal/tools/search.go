@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -86,6 +87,8 @@ type ScanRecord struct {
 	Reason                string       `json:"reason,omitempty"`
 	Values                []meta.Entry `json:"values,omitempty"`
 	ChangedSinceDiscovery bool         `json:"changed_since_discovery,omitempty"`
+	// Index is the candidate index this record came from.
+	Index int `json:"index"`
 }
 
 type SearchMetadataOut struct {
@@ -138,10 +141,10 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 	if err := spec.Validate(); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
-	candidates, enumErrs := meta.Enumerate(in.Paths, in.Recursive, in.Extensions)
-	for _, e := range enumErrs {
-		out.Errors = append(out.Errors, ToolError{Code: e.Code, Message: e.Message, Path: e.Path})
+	if err := guardFastLevel(spec); err != nil {
+		return fail("INVALID_ARGUMENT", err.Error())
 	}
+	candidates, enumErrs := meta.Enumerate(in.Paths, in.Recursive, in.Extensions)
 	result, err := a.Store.CreateResult(store.KindRecords)
 	if err != nil {
 		return fail(storeErrorCode(err), err.Error())
@@ -154,6 +157,18 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 		SpecJSON:   specJSON,
 		ReturnTags: in.ReturnTags,
 		Candidates: candidates,
+	}
+	// Enumeration errors are part of the scan's persisted state:
+	// they are reported by every batch call (via ErrorDetails) and
+	// keep the final status partial — part of the requested input
+	// was never examined, so the scan is not "complete".
+	for _, e := range enumErrs {
+		job.EnumErrors++
+		addScanError(job, e.Code, e.Message, e.Path)
+	}
+	if in.TimeContext != nil {
+		job.TimeContext = in.TimeContext.Timezone
+		job.HasTimeContext = true
 	}
 	if err := a.Store.CreateScan(job); err != nil {
 		return fail(storeErrorCode(err), err.Error())
@@ -169,6 +184,19 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 		out.Errors = append(out.Errors, ToolError{Code: code, Message: msg})
 		return errResult(), out, nil
 	}
+	// Serialize batches of one scan: a concurrent resume waits for the
+	// running batch, then continues from its committed checkpoint.
+	// The in-process mutex covers this server; the store lock extends
+	// the same guarantee to a second server process sharing the
+	// store directory.
+	lock := a.scanLock(in.ResumeToken)
+	lock.Lock()
+	defer lock.Unlock()
+	release, err := a.Store.LockScan(ctx, in.ResumeToken)
+	if err != nil {
+		return fail(storeErrorCode(err), err.Error())
+	}
+	defer release()
 	job, err := a.Store.LoadScan(in.ResumeToken)
 	if err != nil {
 		return fail(storeErrorCode(err), err.Error())
@@ -177,14 +205,38 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 	if err != nil {
 		return fail(storeErrorCode(err), err.Error())
 	}
-	if resultMeta.TotalRecords != job.CommittedRecords {
+	if resultMeta.TotalRecords < job.CommittedRecords {
 		return fail("CHECKPOINT_CORRUPT", "stored records do not match the scan checkpoint; the scan cannot be resumed safely")
+	}
+	if resultMeta.TotalRecords > job.CommittedRecords {
+		// A batch appended its records but the checkpoint save was
+		// lost (crash between the two writes). The batch's other
+		// outcomes — no-matches and per-file errors — were never
+		// persisted, so adopting its records would corrupt the
+		// counts (earlier recovery turned lost errors into
+		// no-matches). Roll the result back to the checkpoint and
+		// let the batch be reprocessed from its start instead.
+		if err := a.Store.TruncateRecords(job.ResultID, job.CommittedRecords); err != nil {
+			return fail("CHECKPOINT_CORRUPT", err.Error())
+		}
 	}
 	var node query.Node
 	if err := json.Unmarshal(job.QueryJSON, &node); err != nil {
 		return fail("CHECKPOINT_CORRUPT", err.Error())
 	}
-	prepared, err := query.Prepare(&node, in.TimeContext)
+	// The scan's timezone assumption is frozen at scan start: a
+	// resume may not add one to a scan that began without it, nor
+	// change the one it began with — later batches would otherwise
+	// judge datetimes by a different rule than earlier ones.
+	hasTC := job.HasTimeContext || job.TimeContext != ""
+	if in.TimeContext != nil && (!hasTC || in.TimeContext.Timezone != job.TimeContext) {
+		return fail("INVALID_ARGUMENT", "time_context is frozen when the scan starts and cannot be added or changed on resume")
+	}
+	var tc *query.TimeContext
+	if hasTC {
+		tc = &query.TimeContext{Timezone: job.TimeContext}
+	}
+	prepared, err := query.Prepare(&node, tc)
 	if err != nil {
 		return fail("CHECKPOINT_CORRUPT", err.Error())
 	}
@@ -192,8 +244,69 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 	if err := json.Unmarshal(job.SpecJSON, &spec); err != nil {
 		return fail("CHECKPOINT_CORRUPT", err.Error())
 	}
+	if err := guardFastLevel(spec); err != nil {
+		return fail("INVALID_ARGUMENT", err.Error())
+	}
 	out.EffectiveOptions = spec.Describe()
 	return a.runSearchBatch(ctx, in, job, prepared, spec, out)
+}
+
+// maxStoredScanErrors caps how many per-file error details a
+// checkpoint persists; the exact total always remains in
+// ScanJob.Errors.
+const maxStoredScanErrors = 200
+
+// addScanError records a per-file error in the checkpoint so it is
+// still reported by later resumes.
+func addScanError(job *store.ScanJob, code, message, path string) {
+	if len(job.ErrorDetails) >= maxStoredScanErrors {
+		return
+	}
+	job.ErrorDetails = append(job.ErrorDetails, store.ScanError{Code: code, Message: message, Path: path})
+}
+
+// readFilesIndividually reads files one at a time after a batch
+// read timed out, under the scan call's shared work deadline (ctx):
+// a file gets at most the configured per-invocation timeout within
+// whatever of the deadline remains — the fallback does NOT restart
+// the call's time budget per file. A file whose read fails becomes
+// an error result for that file rather than failing the whole
+// batch. When the work deadline is spent, the files determined so
+// far are returned and the rest of the batch waits for the next
+// call; the caller commits exactly this prefix. Caller cancellation
+// still aborts the call.
+func (a *App) readFilesIndividually(ctx context.Context, files []string, spec meta.ReadSpec) ([]meta.FileResult, error) {
+	out := make([]meta.FileResult, 0, len(files))
+	for _, f := range files {
+		callCtx, cancel := context.WithTimeout(ctx, a.Cfg.CallTimeout)
+		res, err := a.Reader.Read(callCtx, []string{f}, spec)
+		cancel()
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				return nil, ctx.Err()
+			}
+			out = append(out, meta.FileResult{Path: f, Status: "error", Error: err.Error()})
+			if ctx.Err() != nil {
+				break // work deadline spent; the tail waits
+			}
+			continue
+		}
+		out = append(out, res...)
+	}
+	return out, nil
+}
+
+// externalizeValues moves oversized values in scan record entries
+// into the store as text fragments (the same treatment read_metadata
+// gives them), so a search response never carries a huge value
+// inline either.
+func (a *App) externalizeValues(entries []meta.Entry) ([]meta.Entry, error) {
+	for i := range entries {
+		if _, err := a.externalizeEntryValue(&entries[i]); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
 }
 
 // runSearchBatch evaluates one bounded batch of the scan and commits it.
@@ -214,25 +327,33 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 		}
 	}
 	remaining := len(job.Candidates) - job.NextIndex
-	if remaining > 0 && budget > remaining {
+	if remaining <= 0 {
+		// Already fully scanned (e.g. a repeated resume of a
+		// completed scan): report completion instead of slicing
+		// past the candidate list.
+		budget = 0
+	} else if budget > remaining {
 		budget = remaining
 	}
 	var callRecords []ScanRecord
 	if budget > 0 {
-		batchCtx, cancel := context.WithTimeout(ctx, batchTime)
+		// ONE work deadline bounds the whole invocation: the batch
+		// attempt and the per-file fallback both live under it, so
+		// max_seconds is a real bound for the call. (The round-2
+		// fallback escaped it with a fresh timeout per file.)
+		workCtx, cancel := context.WithTimeout(ctx, batchTime)
 		defer cancel()
+		batchStart := job.NextIndex
 		batch := job.Candidates[job.NextIndex : job.NextIndex+budget]
 		files := make([]string, len(batch))
 		changed := make([]bool, len(batch))
+		statErrs := make([]error, len(batch))
 		var alive []int
 		for i, c := range batch {
 			files[i] = c.Path
 			fi, err := os.Stat(c.Path)
 			if err != nil {
-				job.Errors++
-				job.Processed++
-				job.NextIndex++
-				out.Errors = append(out.Errors, ToolError{Code: "PATH_NOT_FOUND", Message: err.Error(), Path: c.Path})
+				statErrs[i] = err
 				continue
 			}
 			if fi.Size() != c.Size || !fi.ModTime().Equal(c.ModTime) {
@@ -240,45 +361,84 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 			}
 			alive = append(alive, i)
 		}
+		var results []meta.FileResult
 		if len(alive) > 0 {
 			aliveFiles := make([]string, len(alive))
 			for j, i := range alive {
 				aliveFiles[j] = files[i]
 			}
-			results, err := a.Reader.Read(batchCtx, aliveFiles, spec)
+			// The batch attempt gets half the work budget; when it
+			// times out, the per-file fallback works with the other
+			// half under the SAME deadline instead of a new one.
+			attemptCtx, acancel := context.WithTimeout(workCtx, batchTime/2)
+			r, err := a.Reader.Read(attemptCtx, aliveFiles, spec)
+			acancel()
+			if err != nil && attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+				// One pathological file can stall every retry of
+				// the same batch forever; read the files one by
+				// one under the remaining work deadline.
+				r, err = a.readFilesIndividually(workCtx, aliveFiles, spec)
+			}
 			if err != nil {
-				// Nothing from this batch is committed; the checkpoint
-				// still points at its start.
+				// Nothing from this batch is committed; the
+				// checkpoint still points at its start.
 				return fail(errorCode(err), err.Error())
 			}
-			for j, fr := range results {
-				i := alive[j]
+			results = r
+		}
+		// Accounting walks the batch in candidate order and
+		// consumes the results as the prefix they are: if the work
+		// deadline stopped the fallback early, the unprocessed tail
+		// is left for the next call — the watermark never skips it.
+		resIdx := 0
+		for i := range batch {
+			if statErrs[i] != nil {
+				job.Errors++
 				job.Processed++
 				job.NextIndex++
-				if fr.Status == "error" {
-					job.Errors++
-					out.Errors = append(out.Errors, ToolError{Code: "EXTRACTION_FAILED", Message: fr.Error, Path: fr.Path})
-					continue
+				addScanError(job, "PATH_NOT_FOUND", statErrs[i].Error(), files[i])
+				continue
+			}
+			if resIdx >= len(results) {
+				break
+			}
+			fr := results[resIdx]
+			resIdx++
+			job.Processed++
+			job.NextIndex++
+			if fr.Status == "error" {
+				job.Errors++
+				addScanError(job, "EXTRACTION_FAILED", fr.Error, fr.Path)
+				continue
+			}
+			tri, reason := prepared.Eval(fr.Entries)
+			switch tri {
+			case query.Match:
+				job.Matched++
+				vals, verr := a.externalizeValues(filterEntries(fr.Entries, job.ReturnTags))
+				if verr != nil {
+					return fail(storeErrorCode(verr), verr.Error())
 				}
-				tri, reason := prepared.Eval(fr.Entries)
-				switch tri {
-				case query.Match:
-					job.Matched++
-					callRecords = append(callRecords, ScanRecord{
-						Path: fr.Path, Status: "match",
-						Values:                filterEntries(fr.Entries, job.ReturnTags),
-						ChangedSinceDiscovery: changed[i],
-					})
-				case query.Indeterminate:
-					job.Indet++
-					callRecords = append(callRecords, ScanRecord{
-						Path: fr.Path, Status: "indeterminate", Reason: reason,
-						Values:                filterEntries(fr.Entries, job.ReturnTags),
-						ChangedSinceDiscovery: changed[i],
-					})
-				default:
-					job.NoMatch++
+				callRecords = append(callRecords, ScanRecord{
+					Path: fr.Path, Status: "match",
+					Values:                vals,
+					ChangedSinceDiscovery: changed[i],
+					Index:                 batchStart + i,
+				})
+			case query.Indeterminate:
+				job.Indet++
+				vals, verr := a.externalizeValues(filterEntries(fr.Entries, job.ReturnTags))
+				if verr != nil {
+					return fail(storeErrorCode(verr), verr.Error())
 				}
+				callRecords = append(callRecords, ScanRecord{
+					Path: fr.Path, Status: "indeterminate", Reason: reason,
+					Values:                vals,
+					ChangedSinceDiscovery: changed[i],
+					Index:                 batchStart + i,
+				})
+			default:
+				job.NoMatch++
 			}
 		}
 	}
@@ -308,7 +468,7 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	out.MatchedCount = job.Matched
 	out.NoMatchCount = job.NoMatch
 	out.IndeterminateCount = job.Indet
-	out.ErrorCount = job.Errors
+	out.ErrorCount = job.Errors + job.EnumErrors
 	out.ScannedCount = job.Processed
 	out.TotalCandidates = len(job.Candidates)
 	out.ScanComplete = job.Done
@@ -317,8 +477,14 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	if !job.Done {
 		out.ResumeToken = job.ID
 		out.Status = "partial"
-	} else if job.Errors > 0 {
+	} else if job.Errors > 0 || job.EnumErrors > 0 {
 		out.Status = "partial"
+	}
+	// Report the scan's accumulated per-file errors (persisted in the
+	// checkpoint, so they survive restarts) after any errors this call
+	// collected before the batch ran (e.g. enumeration errors).
+	for _, e := range job.ErrorDetails {
+		out.Errors = append(out.Errors, ToolError{Code: e.Code, Message: e.Message, Path: e.Path})
 	}
 	return okResult(false), out, nil
 }
@@ -375,7 +541,8 @@ func filterEntries(entries []meta.Entry, selectors []string) []meta.Entry {
 }
 
 // selectorMatches mirrors the query package's selector semantics for
-// shaping return values.
+// shaping return values (tag and group names are case-insensitive,
+// as ExifTool resolves them).
 func selectorMatches(e meta.Entry, sel string) bool {
 	group, name := "", sel
 	for i := 0; i < len(sel); i++ {
@@ -384,15 +551,15 @@ func selectorMatches(e meta.Entry, sel string) bool {
 			break
 		}
 	}
-	if name != "All" && e.Name != name {
+	if !strings.EqualFold(name, "All") && !strings.EqualFold(e.Name, name) {
 		return false
 	}
-	if group == "" || e.Group == group {
+	if group == "" || strings.EqualFold(e.Group, group) {
 		return true
 	}
 	// Any family segment may be used to reference the group.
 	for _, seg := range splitColon(e.Group) {
-		if seg == group {
+		if strings.EqualFold(seg, group) {
 			return true
 		}
 	}

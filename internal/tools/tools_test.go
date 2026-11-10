@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -298,6 +299,274 @@ func TestSearchResumeRestartFrozen(t *testing.T) {
 	}
 }
 
+func TestSearchResumeKeepsTimeContext(t *testing.T) {
+	// Two files with a naive DateTimeOriginal of 10:00. The query asks
+	// "after 04:00Z". Under the scan's +07:00 assumption the naive time
+	// is 03:00Z (no_match); without any assumption the comparison is
+	// mixed-timezone and indeterminate. The first batch runs with the
+	// time context; the resume (after a simulated restart) sends none
+	// and must reuse the stored one, or the second file's verdict
+	// silently changes mid-scan.
+	requireExifTool(t)
+	dir := t.TempDir()
+	for _, name := range []string{"a.jpg", "b.jpg"} {
+		p := filepath.Join(dir, name)
+		writeJPEG(t, p)
+		cli(t, "-q", "-overwrite_original", "-EXIF:DateTimeOriginal=2023:05:01 10:00:00", p)
+	}
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "DateTimeOriginal", Operator: "after",
+		Value: "2023-05-01T04:00:00Z", ValueType: "datetime"}
+
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir},
+		Query:       q,
+		TimeContext: &query.TimeContext{Timezone: "+07:00"},
+		ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out1.ScanComplete || out1.NoMatchCount != 1 || out1.IndeterminateCount != 0 {
+		t.Fatalf("first batch wrong: %+v", out1)
+	}
+	app2, _ := newTestApp(t, storeDir)
+	_, out2, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{ResumeToken: out1.ResumeToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out2.ScanComplete || out2.NoMatchCount != 2 || out2.IndeterminateCount != 0 {
+		t.Fatalf("resume lost the stored time_context: %+v", out2)
+	}
+}
+
+func TestSearchResumeAfterCrashWindow(t *testing.T) {
+	// Simulate a crash between committing a batch's records and
+	// saving its checkpoint: the records stay, the checkpoint is
+	// rewound to the pre-batch state. Resume must roll the
+	// uncounted records back and reprocess the batch — not fail
+	// with CHECKPOINT_CORRUPT, not duplicate any record, and not
+	// lose the crashed batch's error classification.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir},
+		Query:       q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out1.MatchedCount != 2 || out1.ResumeToken == "" {
+		t.Fatalf("first batch wrong: %+v", out1)
+	}
+	// Rewind the checkpoint to before the batch; the committed
+	// records (2 matches) remain in the result store.
+	job, err := app1.Store.LoadScan(out1.ResumeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.CommittedRecords, job.NextIndex, job.Processed = 0, 0, 0
+	job.Matched, job.NoMatch, job.Indet, job.Errors = 0, 0, 0, 0
+	job.ErrorDetails = nil
+	if err := app1.Store.SaveScan(job); err != nil {
+		t.Fatal(err)
+	}
+	// Resume after a restart: rollback + reprocessing.
+	app2, _ := newTestApp(t, storeDir)
+	_, out2, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{ResumeToken: out1.ResumeToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Status == "failed" {
+		t.Fatalf("resume after crash window failed: %+v", out2.Errors)
+	}
+	if !out2.ScanComplete || out2.ScannedCount != 4 {
+		t.Fatalf("scan did not complete after recovery: %+v", out2)
+	}
+	if out2.MatchedCount != 2 || out2.NoMatchCount != 1 || out2.ErrorCount != 1 {
+		t.Fatalf("counts after rollback wrong: %+v", out2)
+	}
+	_, page, err := app2.getResultPage(ctx, nil, GetResultPageIn{ResultID: out2.ResultID, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("expected exactly 2 stored records (no duplicates), got %d", len(page.Items))
+	}
+	// The corrupt file's error, recorded by the reprocessed batch,
+	// is part of the persisted error history.
+	foundErr := false
+	for _, e := range out2.Errors {
+		if e.Code == "EXTRACTION_FAILED" {
+			foundErr = true
+		}
+	}
+	if !foundErr {
+		t.Fatalf("expected persisted EXTRACTION_FAILED error, got %+v", out2.Errors)
+	}
+}
+
+func TestSearchConcurrentResume(t *testing.T) {
+	// Two resumes of the same token at the same time must serialize:
+	// both succeed, and the scan's records are written exactly once.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+
+	app, _ := newTestApp(t, storeDir)
+	_, out1, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir},
+		Query:       q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := out1.ResumeToken
+	if token == "" {
+		t.Fatalf("expected a resume token: %+v", out1)
+	}
+	var wg sync.WaitGroup
+	outs := make([]SearchMetadataOut, 2)
+	errs := make([]error, 2)
+	for k := 0; k < 2; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			_, o, e := app.searchMetadata(ctx, nil, SearchMetadataIn{ResumeToken: token})
+			outs[k], errs[k] = o, e
+		}(k)
+	}
+	wg.Wait()
+	for k := range errs {
+		if errs[k] != nil {
+			t.Fatal(errs[k])
+		}
+		if outs[k].Status == "failed" {
+			t.Fatalf("concurrent resume %d failed: %+v", k, outs[k].Errors)
+		}
+		if !outs[k].ScanComplete || outs[k].MatchedCount != 2 {
+			t.Fatalf("concurrent resume %d wrong totals: %+v", k, outs[k])
+		}
+	}
+	_, page, err := app.getResultPage(ctx, nil, GetResultPageIn{ResultID: out1.ResultID, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("expected exactly 2 stored records, got %d", len(page.Items))
+	}
+}
+
+func TestReadDuplicatesPreserved(t *testing.T) {
+	// A JPEG with two COM segments holds two File:Comment tags in the
+	// same group. A duplicates read must return both, distinguished by
+	// their copy identity; ExifTool drops the second without -G4.
+	requireExifTool(t)
+	data := jpegBytes(t)
+	com := func(s string) []byte {
+		seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+		return append(seg, s...)
+	}
+	dup := append([]byte{}, data[:2]...)
+	dup = append(dup, com("first comment")...)
+	dup = append(dup, com("second comment")...)
+	dup = append(dup, data[2:]...)
+	path := filepath.Join(t.TempDir(), "dup.jpg")
+	if err := os.WriteFile(path, dup, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	_, out, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:          []string{path},
+		MetadataFilter: &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+		ReadOptions:    &ReadOptionsInput{IncludeDuplicates: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Items) != 1 || out.Items[0].Status != "ok" {
+		t.Fatalf("read failed: %+v", out)
+	}
+	var values []string
+	var copies []string
+	for _, e := range out.Items[0].Entries {
+		if s, ok := e.Value.(string); ok {
+			values = append(values, s)
+			copies = append(copies, e.Copy)
+		}
+	}
+	if len(values) != 2 || values[0] != "first comment" || values[1] != "second comment" {
+		t.Fatalf("duplicates not preserved: %v", values)
+	}
+	if copies[0] != "" || copies[1] != "Copy1" {
+		t.Fatalf("copy identity wrong: %v", copies)
+	}
+}
+
+func TestReadMetadataPagingAcrossChunks(t *testing.T) {
+	// 250 files with a page size of 100: the first page comes from
+	// the first chunk, the rest must be walkable through the stored
+	// result with no record lost or duplicated across chunk and
+	// segment boundaries.
+	requireExifTool(t)
+	dir := t.TempDir()
+	const n = 250
+	for i := 0; i < n; i++ {
+		writeJPEG(t, filepath.Join(dir, fmt.Sprintf("f%03d.jpg", i)))
+	}
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	_, out, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:           []string{dir},
+		ResponseOptions: &ResponseOptionsInput{PageSize: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Items) != 100 || !out.HasMore || out.ResultID == "" || out.ProcessedCount != n {
+		t.Fatalf("first page wrong: items=%d hasMore=%v result=%q processed=%d",
+			len(out.Items), out.HasMore, out.ResultID, out.ProcessedCount)
+	}
+	seen := make(map[string]bool)
+	for _, it := range out.Items {
+		seen[it.Path] = true
+	}
+	cursor := out.NextCursor
+	for cursor != "" {
+		_, page, err := app.getResultPage(ctx, nil, GetResultPageIn{ResultID: out.ResultID, Cursor: cursor, PageSize: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, raw := range page.Items {
+			var fr meta.FileResult
+			if err := json.Unmarshal(raw, &fr); err != nil {
+				t.Fatal(err)
+			}
+			if seen[fr.Path] {
+				t.Fatalf("duplicate across pages: %s", fr.Path)
+			}
+			seen[fr.Path] = true
+		}
+		if !page.HasMore {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != n {
+		t.Fatalf("paged %d of %d files", len(seen), n)
+	}
+}
+
 func TestSearchChangedAndIndeterminate(t *testing.T) {
 	requireExifTool(t)
 	dir := t.TempDir()
@@ -382,6 +651,174 @@ func TestCompareIntegration(t *testing.T) {
 	}
 	if bad.Status != "failed" || len(bad.Added)+len(bad.Removed)+len(bad.Changed) != 0 {
 		t.Fatalf("expected failed compare with no diff, got %+v", bad)
+	}
+}
+
+func TestCompareDuplicateCopyPairing(t *testing.T) {
+	requireExifTool(t)
+	build := func(comments ...string) string {
+		data := jpegBytes(t)
+		com := func(s string) []byte {
+			seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+			return append(seg, s...)
+		}
+		out := append([]byte{}, data[:2]...)
+		for _, c := range comments {
+			out = append(out, com(c)...)
+		}
+		out = append(out, data[2:]...)
+		p := filepath.Join(t.TempDir(), "x.jpg")
+		if err := os.WriteFile(p, out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	left := build("alpha", "beta")
+	right := build("beta") // first copy deleted; "beta" renumbers to copy one
+	app, _ := newTestApp(t, t.TempDir())
+	_, out, err := app.compareMetadata(context.Background(), nil, CompareMetadataIn{
+		LeftPath: left, RightPath: right,
+		MetadataFilter:   &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+		ReadOptions:      &ReadOptionsInput{IncludeDuplicates: true},
+		IncludeUnchanged: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The honest diff: alpha was removed, beta is unchanged, and no
+	// value "changed" — positional pairing fabricated exactly that.
+	if len(out.Changed) != 0 {
+		t.Fatalf("no value changed, got %+v", out.Changed)
+	}
+	if len(out.Removed) != 1 || out.Removed[0].LeftValue != "alpha" {
+		t.Fatalf("alpha should be the removal, got %+v", out.Removed)
+	}
+	if len(out.Unchanged) != 1 || out.Unchanged[0].LeftValue != "beta" {
+		t.Fatalf("beta should be unchanged, got %+v", out.Unchanged)
+	}
+}
+
+func TestCompareUnchangedExcludedFromPages(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	_, out, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: filepath.Join(dir, "a.jpg"), RightPath: filepath.Join(dir, "c.jpg"),
+		ResponseOptions: &ResponseOptionsInput{PageSize: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.UnchangedCount == 0 {
+		t.Fatal("expected some unchanged tags between the two Canon photos")
+	}
+	if len(out.Unchanged) != 0 {
+		t.Fatalf("unchanged records leaked into the response: %+v", out.Unchanged)
+	}
+	if out.ResultID == "" {
+		t.Fatal("expected overflow to be stored for paging")
+	}
+	_, page, err := app.Store.RecordsPage(out.ResultID, 0, 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawChange := false
+	for _, raw := range page.Records {
+		var rec ChangeRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Change == "unchanged" {
+			t.Fatalf("unchanged record leaked into the stored result: %+v", rec)
+		}
+		if rec.Change == "changed" {
+			sawChange = true
+		}
+	}
+	if !sawChange {
+		t.Fatal("stored result should contain the ISO change")
+	}
+}
+
+func TestFilterModeTypoRejected(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	a := filepath.Join(dir, "a.jpg")
+	_, out, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:          []string{a},
+		MetadataFilter: &MetadataFilter{Mode: "slect", IncludeTags: []string{"Make"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("mistyped filter mode must be rejected, got %+v", out)
+	}
+	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: a, RightPath: a,
+		MetadataFilter: &MetadataFilter{Mode: "slect"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cout.Status != "failed" || len(cout.Errors) == 0 || cout.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("mistyped filter mode must be rejected in compare, got %+v", cout)
+	}
+}
+
+func TestFastLevelGuardForConclusions(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	a := filepath.Join(dir, "a.jpg")
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("search with fast_scan_level 2 must be rejected, got %+v", out)
+	}
+	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: a, RightPath: a,
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cout.Status != "failed" || len(cout.Errors) == 0 || cout.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("compare with fast_scan_level 4 must be rejected, got %+v", cout)
+	}
+	// A plain read keeps the option: the caller asked for the
+	// extraction itself, and the effective options disclose it.
+	_, rout, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:       []string{a},
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rout.Status == "failed" {
+		t.Fatalf("plain read with fast_scan_level 3 should not be rejected: %+v", rout)
+	}
+}
+
+func TestSearchTagCaseInsensitive(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "predicate", Tag: "make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.MatchedCount != 2 {
+		t.Fatalf("lowercase tag should match both Canon photos: %+v", out)
 	}
 }
 
@@ -504,5 +941,518 @@ func TestPagingDoesNotInvokeExifTool(t *testing.T) {
 	}
 	if cr.calls.Load() != callsBefore {
 		t.Fatal("get_result_page invoked exiftool")
+	}
+}
+
+func TestSearchResumeCannotChangeTimeContext(t *testing.T) {
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+
+	// A scan started WITHOUT a time_context cannot gain one on
+	// resume: later batches would judge datetimes by a rule the
+	// earlier batches did not use.
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out2, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		ResumeToken: out1.ResumeToken,
+		TimeContext: &query.TimeContext{Timezone: "Asia/Jakarta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Status != "failed" || len(out2.Errors) == 0 || out2.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("adding a time_context on resume must be rejected: %+v", out2)
+	}
+
+	// A scan started WITH one cannot switch to another, but may
+	// repeat the same one.
+	app2, _ := newTestApp(t, storeDir)
+	_, out3, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+		TimeContext: &query.TimeContext{Timezone: "Asia/Jakarta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, out4, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{
+		ResumeToken: out3.ResumeToken,
+		TimeContext: &query.TimeContext{Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out4.Status != "failed" || len(out4.Errors) == 0 || out4.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("changing the time_context on resume must be rejected: %+v", out4)
+	}
+	_, out5, err := app2.searchMetadata(ctx, nil, SearchMetadataIn{
+		ResumeToken: out3.ResumeToken,
+		TimeContext: &query.TimeContext{Timezone: "Asia/Jakarta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out5.Status == "failed" {
+		t.Fatalf("repeating the same time_context must be accepted: %+v", out5)
+	}
+}
+
+func TestSearchConcurrentResumeAcrossApps(t *testing.T) {
+	// Two App instances over one store directory stand in for two
+	// server processes sharing it: the store-level scan lock must
+	// serialize their batches so no record is ever duplicated.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	app1, _ := newTestApp(t, storeDir)
+	_, out1, err := app1.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app2, _ := newTestApp(t, storeDir)
+	apps := []*App{app1, app2}
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, _ = apps[i%2].searchMetadata(ctx, nil, SearchMetadataIn{
+				ResumeToken: out1.ResumeToken, ScanOptions: &ScanOptionsInput{MaxFiles: 1},
+			})
+		}(i)
+	}
+	wg.Wait()
+	job, err := app1.Store.LoadScan(out1.ResumeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.Done || job.Processed != 4 || job.Matched != 2 || job.NoMatch != 1 || job.Errors != 1 {
+		t.Fatalf("scan state after concurrent resumes: %+v", job)
+	}
+	m, err := app1.Store.LoadMeta(job.ResultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.TotalRecords != 2 {
+		t.Fatalf("expected exactly 2 records (no duplicates), got %d", m.TotalRecords)
+	}
+}
+
+// stallRunner simulates a pathological ExifTool: multi-file reads —
+// and reads of the corrupt fixture at any size — block until the
+// context ends, while ordinary single-file reads answer at once.
+type stallRunner struct{}
+
+func (stallRunner) Path() string       { return "stall" }
+func (stallRunner) ConfigMode() string { return "standard" }
+
+func (stallRunner) Run(ctx context.Context, args ...string) (runner.Result, error) {
+	var files []string
+	for _, a := range args {
+		if strings.HasSuffix(a, ".jpg") {
+			files = append(files, a)
+		}
+	}
+	stall := len(files) != 1
+	if len(files) == 1 && strings.Contains(files[0], "corrupt") {
+		stall = true
+	}
+	if stall {
+		<-ctx.Done()
+		return runner.Result{}, ctx.Err()
+	}
+	f := files[0]
+	make_ := "Canon"
+	if strings.Contains(f, "b.jpg") {
+		make_ = "Nikon"
+	}
+	// Marshal properly: a Windows path's backslashes are not valid
+	// JSON string escapes when concatenated by hand.
+	payload, err := json.Marshal([]map[string]string{
+		{"SourceFile": f, "EXIF:IFD0:Make": make_},
+	})
+	if err != nil {
+		return runner.Result{}, err
+	}
+	return runner.Result{Stdout: payload}, nil
+}
+
+func TestSearchBatchTimeoutFallsBackPerFile(t *testing.T) {
+	// The batch read times out because one file stalls forever.
+	// The scan must still complete in a single call: healthy files
+	// are read individually and the stalling file becomes a
+	// per-file error instead of a permanent roadblock.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	cfg := config.Config{
+		StoreDir: storeDir, CallTimeout: 2 * time.Second, MaxConcurrency: 4,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 1 << 30,
+		ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	st, err := store.New(storeDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := stallRunner{}
+	app := &App{Cfg: cfg, Runner: sr, Reader: &meta.Reader{Runner: sr}, Store: st}
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 4, MaxSeconds: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status == "failed" {
+		t.Fatalf("batch timeout must not fail the scan: %+v", out.Errors)
+	}
+	if !out.ScanComplete || out.ScannedCount != 4 {
+		t.Fatalf("scan should complete despite the stalling file: %+v", out)
+	}
+	if out.MatchedCount != 2 || out.NoMatchCount != 1 || out.ErrorCount != 1 {
+		t.Fatalf("wrong counts after per-file fallback: %+v", out)
+	}
+}
+
+func TestSearchEnumerationErrorKeepsStatusPartial(t *testing.T) {
+	// One input path does not exist: the scan over the valid path
+	// completes, but the final status must stay partial and the
+	// enumeration error must be reported — part of the requested
+	// input was never examined.
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths:       []string{dir, filepath.Join(dir, "does-not-exist")},
+		Query:       q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.ScanComplete {
+		t.Fatalf("scan over the valid path should complete: %+v", out)
+	}
+	if out.Status != "partial" {
+		t.Fatalf("status must stay partial when enumeration failed, got %q", out.Status)
+	}
+	found := false
+	for _, e := range out.Errors {
+		if e.Code == "PATH_NOT_FOUND" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("enumeration error not reported: %+v", out.Errors)
+	}
+}
+
+func TestReadOversizedValueStoreFailureIsLoud(t *testing.T) {
+	// A value too large to inline is externalized to the store.
+	// When that store write fails (here: a quota smaller than the
+	// value), the read must fail loudly — leaving the value inline
+	// would silently blow the response byte budget.
+	requireExifTool(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big.jpg")
+	writeJPEG(t, p)
+	// The 40 KB value travels in a file (-TAG<=file): passing it as
+	// a command-line argument exceeds the Windows process limit.
+	valueFile := filepath.Join(dir, "comment.txt")
+	if err := os.WriteFile(valueFile, []byte(strings.Repeat("x", 40000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli(t, "-q", "-overwrite_original", "-Comment<="+valueFile, p)
+	storeDir := t.TempDir()
+	cfg := config.Config{
+		StoreDir: storeDir, CallTimeout: 60 * time.Second, MaxConcurrency: 4,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 2048,
+		ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	st, err := store.New(storeDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rn := runner.New(cfg)
+	app := &App{Cfg: cfg, Runner: rn, Reader: &meta.Reader{Runner: rn}, Store: st}
+	_, out, err := app.readMetadata(context.Background(), nil, ReadMetadataIn{
+		Paths:          []string{p},
+		MetadataFilter: &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "RESULT_STORE_FULL" {
+		t.Fatalf("oversized value with a full store must fail as RESULT_STORE_FULL, got %+v", out)
+	}
+}
+
+func TestReaderCombinedGroupFamiliesRealExifTool(t *testing.T) {
+	// Real-binary integration for the combined -G argument: with
+	// include_duplicates (and with -ee), entries must keep their
+	// real groups. Separate -G flags made ExifTool drop them
+	// (keys came back as ":Make" / "Main:Make").
+	requireExifTool(t)
+	dir := t.TempDir()
+	// A valid JPEG carrying two COM segments (duplicate comments)
+	// plus a real Make tag.
+	p := filepath.Join(dir, "dup.jpg")
+	base := jpegBytes(t)
+	var buf []byte
+	buf = append(buf, base[:2]...)
+	for _, s := range []string{"alpha", "beta"} {
+		seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+		seg = append(seg, s...)
+		buf = append(buf, seg...)
+	}
+	buf = append(buf, base[2:]...)
+	if err := os.WriteFile(p, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli(t, "-q", "-overwrite_original", "-Make=Canon", p)
+
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	read := func(spec meta.ReadSpec) []meta.Entry {
+		res, err := app.Reader.Read(ctx, []string{p}, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Status == "error" {
+			t.Fatalf("read failed: %+v", res)
+		}
+		return res[0].Entries
+	}
+	spec := meta.ReadSpec{IncludeTags: []string{"Comment", "EXIF:Make"}, IncludeDuplicates: true}
+	entries := read(spec)
+	var comments []meta.Entry
+	groups := map[string]bool{}
+	for _, e := range entries {
+		groups[e.Name+"|"+e.Group] = true
+		if e.Name == "Comment" {
+			comments = append(comments, e)
+		}
+		if e.Name == "Make" && !strings.HasPrefix(e.Group, "EXIF") {
+			t.Errorf("Make lost its group under include_duplicates: %+v", e)
+		}
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 Comment entries, got %d (%v)", len(comments), groups)
+	}
+	copies := map[string]bool{}
+	for _, c := range comments {
+		if c.Group != "File" {
+			t.Errorf("Comment group = %q, want File", c.Group)
+		}
+		copies[c.Copy] = true
+	}
+	if !copies[""] || !copies["Copy1"] {
+		t.Errorf("duplicate copies not distinguished: %v", copies)
+	}
+	// Embedded reads keep groups AND gain document identity.
+	spec.EmbeddedLevel = 2
+	for _, e := range read(spec) {
+		if e.Name == "Make" {
+			if !strings.HasPrefix(e.Group, "EXIF") {
+				t.Errorf("Make lost its group under -ee: %+v", e)
+			}
+			if e.Document != "Main" {
+				t.Errorf("Make document = %q, want Main", e.Document)
+			}
+		}
+	}
+}
+
+// slowRunner: multi-file reads stall forever; single-file reads
+// take 300 ms each and then answer.
+type slowRunner struct{}
+
+func (slowRunner) Path() string       { return "slow" }
+func (slowRunner) ConfigMode() string { return "standard" }
+
+func (slowRunner) Run(ctx context.Context, args ...string) (runner.Result, error) {
+	var files []string
+	for _, a := range args {
+		if strings.HasSuffix(a, ".jpg") {
+			files = append(files, a)
+		}
+	}
+	if len(files) != 1 {
+		<-ctx.Done()
+		return runner.Result{}, ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return runner.Result{}, ctx.Err()
+	case <-time.After(300 * time.Millisecond):
+	}
+	f := files[0]
+	make_ := "Canon"
+	if strings.Contains(f, "b.jpg") {
+		make_ = "Nikon"
+	}
+	payload, _ := json.Marshal([]map[string]string{{"SourceFile": f, "EXIF:IFD0:Make": make_}})
+	return runner.Result{Stdout: payload}, nil
+}
+
+func TestSearchWorkDeadlineBoundsWholeCall(t *testing.T) {
+	// max_seconds bounds the WHOLE call — batch attempt and
+	// per-file fallback share one deadline. A call over slow files
+	// returns within budget, commits exactly the prefix it
+	// finished, and leaves the tail for the next call.
+	dir := setupPhotos(t)
+	storeDir := t.TempDir()
+	cfg := config.Config{
+		StoreDir: storeDir, CallTimeout: 5 * time.Second, MaxConcurrency: 4,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 1 << 30,
+		ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	st, err := store.New(storeDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := slowRunner{}
+	app := &App{Cfg: cfg, Runner: sr, Reader: &meta.Reader{Runner: sr}, Store: st}
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	start := time.Now()
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+		ScanOptions: &ScanOptionsInput{MaxFiles: 4, MaxSeconds: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("call outlived its work deadline: %v", elapsed)
+	}
+	if out.ScanComplete {
+		t.Fatalf("slow files cannot all finish within 1s: %+v", out)
+	}
+	if out.ScannedCount == 0 || out.ScannedCount >= 4 || out.ResumeToken == "" {
+		t.Fatalf("expected a committed prefix with a resume token: %+v", out)
+	}
+	token := out.ResumeToken
+	var final SearchMetadataOut
+	for i := 0; i < 5; i++ {
+		_, o, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+			ResumeToken: token, ScanOptions: &ScanOptionsInput{MaxSeconds: 2},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		final = o
+		if o.ScanComplete {
+			break
+		}
+	}
+	if !final.ScanComplete || final.ScannedCount != 4 {
+		t.Fatalf("resumes should complete the scan exactly once per file: %+v", final)
+	}
+	job, err := app.Store.LoadScan(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Matched+job.NoMatch+job.Indet+job.Errors != 4 {
+		t.Fatalf("every candidate must be accounted exactly once: %+v", job)
+	}
+	m, err := app.Store.LoadMeta(job.ResultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.TotalRecords != job.Matched+job.Indet {
+		t.Fatalf("stored records %d != matched+indeterminate %d (duplicates?)", m.TotalRecords, job.Matched+job.Indet)
+	}
+}
+
+func TestSearchExternalizesOversizedValues(t *testing.T) {
+	// A matched record's oversized return value must be stored as
+	// a text fragment with a value_ref — the same treatment
+	// read_metadata gives it — never shipped inline.
+	requireExifTool(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big.jpg")
+	writeJPEG(t, p)
+	valueFile := filepath.Join(dir, "comment.txt")
+	if err := os.WriteFile(valueFile, []byte(strings.Repeat("x", 40000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli(t, "-q", "-overwrite_original", "-Comment<="+valueFile, p)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "predicate", Tag: "Comment", Operator: "exists"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{p}, Query: q, ReturnTags: []string{"Comment"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.MatchedCount != 1 || len(out.Items) != 1 || len(out.Items[0].Values) != 1 {
+		t.Fatalf("expected one matched record with one value: %+v", out)
+	}
+	v := out.Items[0].Values[0]
+	if v.ValueRef == nil || v.Value != nil {
+		t.Fatalf("oversized value was not externalized: value=%v ref=%v", v.Value != nil, v.ValueRef)
+	}
+	_, chunk, _, err := app.Store.Fragment(v.ValueRef.ResultID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunk) != 100 {
+		t.Fatalf("stored fragment should hold the value, got %d bytes", len(chunk))
+	}
+}
+
+func TestDiscoverGroupFilterCaseInsensitive(t *testing.T) {
+	// The group filter matches case-insensitively: "exif" selects
+	// tags in the EXIF group.
+	requireExifTool(t)
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	_, out, err := app.discoverTags(context.Background(), nil, DiscoverTagsIn{
+		Scope: "present_in_files", Query: "Make", Paths: []string{dir}, Group: "exif",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, it := range out.Items {
+		if it.Name == "Make" && it.Group != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("group filter \"exif\" matched nothing: %+v", out.Items)
+	}
+}
+
+func TestSearchErrorCountIncludesEnumErrors(t *testing.T) {
+	// Enumeration failures are errors of the scan and must be
+	// included in error_count, not just listed.
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir, filepath.Join(dir, "does-not-exist.jpg")}, Query: q,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// setupPhotos' corrupt.jpg fails extraction (1) and the missing
+	// path fails enumeration (1): error_count must report both.
+	if out.ErrorCount != 2 {
+		t.Fatalf("error_count = %d, want 2 (extraction + enumeration): %+v", out.ErrorCount, out)
 	}
 }

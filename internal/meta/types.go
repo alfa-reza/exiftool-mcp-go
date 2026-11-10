@@ -18,6 +18,7 @@ type Entry struct {
 	Value    any    `json:"value"`              // scalar, array or struct from ExifTool
 	Document string `json:"document,omitempty"` // document id if ExifTool provided one (e.g. "Doc1")
 	Instance string `json:"instance,omitempty"` // instance id if provided
+	Copy     string `json:"copy,omitempty"`     // duplicate copy id if provided (e.g. "Copy1", from -G4)
 	// ValueRef is set when the value was too large for the response and
 	// was moved to the result store as a text fragment.
 	ValueRef     *ValueRef `json:"value_ref,omitempty"`
@@ -44,8 +45,8 @@ type FileResult struct {
 }
 
 // ParseKey splits a raw ExifTool JSON key into group, tag name, and
-// document/instance provenance when present.
-func ParseKey(key string) (group, name, document, instance string) {
+// document/instance/copy provenance when present.
+func ParseKey(key string) (group, name, document, instance, copyID string) {
 	parts := strings.Split(key, ":")
 	name = parts[len(parts)-1]
 	// Strip a trailing copy suffix like " (1)" from the display name but
@@ -59,22 +60,52 @@ func ParseKey(key string) (group, name, document, instance string) {
 		case isDocPart(p) || p == "Main":
 			// Family-3 document segment: "Main" for the main document,
 			// "Doc1", "Doc2", ... for embedded documents (-ee reads).
+			// Sub-documents are numbered like "Doc2-3".
 			document = p
 		case strings.HasPrefix(p, "Instance"):
 			instance = p
+		case isCopyPart(p):
+			// Family-4 copy segment from -G4: "Copy1", "Copy2", ...
+			// distinguishes duplicate tags within one group.
+			copyID = p
 		default:
 			groupParts = append(groupParts, p)
 		}
 	}
 	group = strings.Join(groupParts, ":")
-	return group, name, document, instance
+	return group, name, document, instance, copyID
 }
 
+// isDocPart reports whether p is a family-3 document segment: "Doc"
+// followed by a document number, optionally with dash-separated
+// sub-document numbers ("Doc1", "Doc2-3", "Doc1-2-1").
 func isDocPart(p string) bool {
-	if !strings.HasPrefix(p, "Doc") || len(p) <= 3 {
+	if !strings.HasPrefix(p, "Doc") {
 		return false
 	}
-	for _, r := range p[3:] {
+	rest := p[3:]
+	if rest == "" {
+		return false
+	}
+	for _, seg := range strings.Split(rest, "-") {
+		if seg == "" {
+			return false
+		}
+		for _, r := range seg {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isCopyPart reports whether p is a family-4 copy segment ("Copy1", ...).
+func isCopyPart(p string) bool {
+	if !strings.HasPrefix(p, "Copy") || len(p) <= 4 {
+		return false
+	}
+	for _, r := range p[4:] {
 		if r < '0' || r > '9' {
 			return false
 		}
@@ -84,8 +115,8 @@ func isDocPart(p string) bool {
 
 // EntryFromPair builds an Entry from a raw JSON key/value pair.
 func EntryFromPair(key string, value any) Entry {
-	g, n, d, inst := ParseKey(key)
-	return Entry{Key: key, Group: g, Name: n, Value: value, Document: d, Instance: inst}
+	g, n, d, inst, cp := ParseKey(key)
+	return Entry{Key: key, Group: g, Name: n, Value: value, Document: d, Instance: inst, Copy: cp}
 }
 
 // MarshalValue normalizes a value for size checks.

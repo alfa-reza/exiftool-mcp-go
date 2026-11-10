@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/alfa-reza/exiftool-mcp-go/internal/meta"
@@ -157,6 +158,26 @@ func TestDatetimeSemantics(t *testing.T) {
 	}
 }
 
+func TestDatetimeInclusiveBounds(t *testing.T) {
+	// gte/lte must accept a value exactly equal to the bound; gt/lt
+	// must not.
+	es := entries("EXIF:DateTimeOriginal", "2023:05:01 10:00:00")
+	bound := "2023:05:01 10:00:00"
+	for _, tc := range []struct {
+		op   string
+		want Tri
+	}{
+		{"gte", Match}, {"lte", Match}, {"gt", NoMatch}, {"lt", NoMatch},
+		{"before", NoMatch}, {"after", NoMatch},
+	} {
+		n := pred("DateTimeOriginal", tc.op, bound)
+		n.ValueType = "datetime"
+		if got := eval(t, n, nil, es); got != tc.want {
+			t.Fatalf("%s with equal bound: got %v, want %v", tc.op, got, tc.want)
+		}
+	}
+}
+
 func TestSameDocument(t *testing.T) {
 	// GPS position and timestamp in DIFFERENT embedded documents must
 	// not satisfy a same_document group; in the same document they must.
@@ -177,6 +198,77 @@ func TestSameDocument(t *testing.T) {
 	)
 	if got := eval(t, group, nil, es2); got != Match {
 		t.Fatalf("same-document conditions should match: %v", got)
+	}
+	// Without any document identity, the same conditions pooled
+	// together would match, but provenance is unproven: the verdict
+	// must be indeterminate, never a match.
+	es3 := entries(
+		"GPS:GPSLatitude", float64(6.2),
+		"EXIF:DateTimeOriginal", "2023:05:01 10:00:00",
+	)
+	if got := eval(t, group, nil, es3); got != Indeterminate {
+		t.Fatalf("same_document without provenance must be indeterminate: %v", got)
+	}
+}
+
+func TestTagMatchCaseInsensitive(t *testing.T) {
+	// ExifTool resolves tag names case-insensitively; the evaluator
+	// must do the same or real matches silently disappear.
+	es := entries("EXIF:Make", "Canon", "EXIF:ISO", float64(100))
+	for _, tag := range []string{"make", "MAKE", "exif:make", "EXIF:MAKE"} {
+		if got := eval(t, pred(tag, "eq", "Canon"), nil, es); got != Match {
+			t.Fatalf("tag %q should match Make=Canon, got %v", tag, got)
+		}
+	}
+	if got := eval(t, pred("make", "exists", nil), nil, es); got != Match {
+		t.Fatalf("exists should match case-insensitively, got %v", got)
+	}
+	// Values keep their own rule: default comparison is
+	// case-sensitive, so a differently-cased VALUE must not match.
+	if got := eval(t, pred("make", "eq", "canon"), nil, es); got != NoMatch {
+		t.Fatalf("value comparison must stay case-sensitive by default, got %v", got)
+	}
+}
+
+func TestSameDocumentMixedProvenance(t *testing.T) {
+	group := &Node{Type: "all", Scope: "same_document", Children: []*Node{
+		pred("Make", "eq", "Canon"), pred("ISO", "eq", float64(100)),
+	}}
+	// Make is provenanced to Doc1, ISO has no provenance at all. ISO
+	// could belong to Doc1, so the honest verdict is indeterminate —
+	// evaluating the groups in isolation fabricated a no_match here.
+	es := entries("Doc1:EXIF:Make", "Canon", "EXIF:ISO", float64(100))
+	if got := eval(t, group, nil, es); got != Indeterminate {
+		t.Fatalf("mixed provenance should be indeterminate, got %v", got)
+	}
+	// The unprovenanced value cannot satisfy its leg under any
+	// grouping: a definite no_match.
+	es2 := entries("Doc1:EXIF:Make", "Canon", "EXIF:ISO", float64(200))
+	if got := eval(t, group, nil, es2); got != NoMatch {
+		t.Fatalf("unsatisfiable leg should be no_match, got %v", got)
+	}
+	// The provenanced leg itself fails: no_match under any grouping.
+	es3 := entries("Doc1:EXIF:Make", "Nikon", "EXIF:ISO", float64(100))
+	if got := eval(t, group, nil, es3); got != NoMatch {
+		t.Fatalf("failed provenanced leg should be no_match, got %v", got)
+	}
+}
+
+func TestLargeIntegersCompareExactly(t *testing.T) {
+	// 2^53+1 is not representable as float64; comparing through
+	// float64 would call it equal to 2^53.
+	es := entries("EXIF:Big", json.Number("9007199254740993"))
+	if got := eval(t, pred("Big", "eq", json.Number("9007199254740992")), nil, es); got != NoMatch {
+		t.Fatalf("9007199254740993 must not equal 9007199254740992, got %v", got)
+	}
+	if got := eval(t, pred("Big", "eq", json.Number("9007199254740993")), nil, es); got != Match {
+		t.Fatalf("equal big integers should match, got %v", got)
+	}
+	if got := eval(t, pred("Big", "gt", json.Number("9007199254740992")), nil, es); got != Match {
+		t.Fatalf("big integer ordering should be exact, got %v", got)
+	}
+	if got := eval(t, pred("Big", "between", []any{json.Number("9007199254740992"), json.Number("9007199254740994")}), nil, es); got != Match {
+		t.Fatalf("big integer between should be exact, got %v", got)
 	}
 }
 
@@ -199,5 +291,32 @@ func TestValidationLimits(t *testing.T) {
 	badTag := pred("-config", "eq", "x")
 	if _, err := Prepare(badTag, nil); err == nil {
 		t.Fatal("option-like tag should be rejected")
+	}
+}
+
+func TestStringIdentifiersCompareAsText(t *testing.T) {
+	// Two numeric-looking STRINGS compare as text: leading zeros in
+	// identifiers are significant, so "00123" != "123".
+	es := entries("EXIF:SerialNumber", "00123")
+	if got := eval(t, pred("SerialNumber", "eq", "123"), nil, es); got != NoMatch {
+		t.Fatalf("SerialNumber eq \"123\" = %v, want no_match", got)
+	}
+	if got := eval(t, pred("SerialNumber", "eq", "00123"), nil, es); got != Match {
+		t.Fatalf("SerialNumber eq \"00123\" = %v, want match", got)
+	}
+	if got := eval(t, pred("SerialNumber", "ne", "123"), nil, es); got != Match {
+		t.Fatalf("SerialNumber ne \"123\" = %v, want match", got)
+	}
+	// A genuinely numeric query literal still compares numerically
+	// against a numeric-looking string entry.
+	es2 := entries("EXIF:ISO", "3200")
+	if got := eval(t, pred("ISO", "eq", 3200), nil, es2); got != Match {
+		t.Fatalf("ISO eq 3200 = %v, want match", got)
+	}
+	// An explicit value_type opts back into numeric comparison.
+	n := pred("SerialNumber", "eq", "123")
+	n.ValueType = "number"
+	if got := eval(t, n, nil, es); got != Match {
+		t.Fatalf("SerialNumber eq \"123\" with value_type=number = %v, want match", got)
 	}
 }

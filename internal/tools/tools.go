@@ -29,6 +29,18 @@ type App struct {
 	catMu  sync.Mutex
 	cat    *catalog.Catalog
 	catKey string
+
+	// scanLocks holds one mutex per scan id so that only one batch of
+	// a given scan runs at a time; a concurrent resume waits and then
+	// continues from the updated checkpoint instead of reprocessing
+	// the same batch and duplicating records.
+	scanLocks sync.Map // scan id -> *sync.Mutex
+}
+
+// scanLock returns the mutex guarding the scan with the given id.
+func (a *App) scanLock(id string) *sync.Mutex {
+	m, _ := a.scanLocks.LoadOrStore(id, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 // ToolError is a structured error entry in tool output.
@@ -60,6 +72,35 @@ func (o *ReadOptionsInput) Spec(include, exclude []string) meta.ReadSpec {
 		s.FastScanLevel = o.FastScanLevel
 	}
 	return s
+}
+
+// filterSelectors resolves a MetadataFilter into include/exclude
+// selectors. An unrecognized mode is a caller error: silently
+// ignoring a mistyped mode ("slect") would return unfiltered
+// metadata the caller explicitly tried to restrict.
+func filterSelectors(f *MetadataFilter) (include, exclude []string, mode string, err error) {
+	if f == nil || f.Mode == "" || f.Mode == "none" {
+		return nil, nil, "none", nil
+	}
+	if f.Mode == "select" {
+		return f.IncludeTags, f.ExcludeTags, "select", nil
+	}
+	return nil, nil, "", fmt.Errorf("metadata_filter.mode %q is not supported (use \"none\" or \"select\")", f.Mode)
+}
+
+// guardFastLevel rejects read options whose extraction level cannot
+// support conclusions. fast_scan_level 2 already omits MakerNotes
+// and other metadata, and level 3+ extracts none at all (system tags
+// only), so a query verdict or a diff computed over such a read
+// would mistake "not read" for "not present" — most dangerously for
+// `missing` predicates. Plain reads keep the option: there the
+// caller asked for the extraction itself, and the effective options
+// disclose it.
+func guardFastLevel(spec meta.ReadSpec) error {
+	if spec.FastScanLevel >= 2 {
+		return fmt.Errorf("fast_scan_level %d skips parts of the metadata (level 2 already omits MakerNotes and other data, level 3+ extracts none) and cannot support conclusions about tag presence or values", spec.FastScanLevel)
+	}
+	return nil
 }
 
 // ResponseOptionsInput controls paging of a tool response.

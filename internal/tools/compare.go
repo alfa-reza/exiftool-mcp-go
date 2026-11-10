@@ -32,6 +32,7 @@ type ChangeRecord struct {
 	Name       string `json:"name"`
 	Document   string `json:"document,omitempty"`
 	Instance   string `json:"instance,omitempty"`
+	Copy       string `json:"copy,omitempty"`
 	LeftValue  any    `json:"left_value,omitempty"`
 	RightValue any    `json:"right_value,omitempty"`
 	Ambiguous  bool   `json:"ambiguous,omitempty"`
@@ -57,6 +58,73 @@ func identityOf(e meta.Entry) string {
 	return e.Group + "\x00" + e.Name + "\x00" + e.Document + "\x00" + e.Instance
 }
 
+// pairBucket pairs the entries of one tag identity between the two
+// sides of a comparison. Duplicate copies pair by VALUE first:
+// ExifTool renumbers copies when one is deleted, so purely
+// positional pairing would report a deleted first copy as a value
+// change of the (renumbered) survivor plus a removal of the second
+// copy. Copies left over after value pairing pair positionally as
+// changes; any excess is a removal or an addition. Each record
+// carries the Copy identity of the entry it came from.
+func pairBucket(ls, rs []meta.Entry, ambiguous bool) []ChangeRecord {
+	mk := func(change string, sample meta.Entry) ChangeRecord {
+		return ChangeRecord{
+			Change: change, Key: sample.Key, Group: sample.Group, Name: sample.Name,
+			Document: sample.Document, Instance: sample.Instance, Copy: sample.Copy,
+			Ambiguous: ambiguous,
+		}
+	}
+	valueKey := func(e meta.Entry) string {
+		b, _ := json.Marshal(e.Value)
+		return string(b)
+	}
+	rightByValue := make(map[string][]int)
+	for j, r := range rs {
+		k := valueKey(r)
+		rightByValue[k] = append(rightByValue[k], j)
+	}
+	usedR := make([]bool, len(rs))
+	var out []ChangeRecord
+	var looseL []int
+	for i, l := range ls {
+		k := valueKey(l)
+		if queue := rightByValue[k]; len(queue) > 0 {
+			j := queue[0]
+			rightByValue[k] = queue[1:]
+			usedR[j] = true
+			rec := mk("unchanged", l)
+			rec.LeftValue, rec.RightValue = l.Value, rs[j].Value
+			out = append(out, rec)
+			continue
+		}
+		looseL = append(looseL, i)
+	}
+	var looseR []int
+	for j := range rs {
+		if !usedR[j] {
+			looseR = append(looseR, j)
+		}
+	}
+	for x := 0; x < max(len(looseL), len(looseR)); x++ {
+		switch {
+		case x >= len(looseL):
+			rec := mk("added", rs[looseR[x]])
+			rec.RightValue = rs[looseR[x]].Value
+			out = append(out, rec)
+		case x >= len(looseR):
+			rec := mk("removed", ls[looseL[x]])
+			rec.LeftValue = ls[looseL[x]].Value
+			out = append(out, rec)
+		default:
+			l, r := ls[looseL[x]], rs[looseR[x]]
+			rec := mk("changed", l)
+			rec.LeftValue, rec.RightValue = l.Value, r.Value
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
 func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in CompareMetadataIn) (*mcp.CallToolResult, CompareMetadataOut, error) {
 	out := CompareMetadataOut{Status: "complete", Complete: true}
 	fail := func(code, msg string) (*mcp.CallToolResult, CompareMetadataOut, error) {
@@ -72,12 +140,15 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 			return fail("INVALID_ARGUMENT", err.Error())
 		}
 	}
-	var include, exclude []string
-	if in.MetadataFilter != nil && in.MetadataFilter.Mode == "select" {
-		include, exclude = in.MetadataFilter.IncludeTags, in.MetadataFilter.ExcludeTags
+	include, exclude, _, ferr := filterSelectors(in.MetadataFilter)
+	if ferr != nil {
+		return fail("INVALID_ARGUMENT", ferr.Error())
 	}
 	spec := in.ReadOptions.Spec(include, exclude)
 	if err := spec.Validate(); err != nil {
+		return fail("INVALID_ARGUMENT", err.Error())
+	}
+	if err := guardFastLevel(spec); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
 	leftAbs := absOf(in.LeftPath)
@@ -132,55 +203,37 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 	var changes []ChangeRecord
 	for id := range identities {
 		ls, rs := lm[id], rm[id]
-		n := max(len(ls), len(rs))
 		ambiguous := len(ls) > 1 || len(rs) > 1
-		for i := 0; i < n; i++ {
-			var rec ChangeRecord
-			var sample meta.Entry
-			if i < len(ls) {
-				sample = ls[i]
-			} else {
-				sample = rs[i]
-			}
-			rec.Key, rec.Group, rec.Name = sample.Key, sample.Group, sample.Name
-			rec.Document, rec.Instance = sample.Document, sample.Instance
-			rec.Ambiguous = ambiguous
-			switch {
-			case i >= len(ls):
-				rec.Change = "added"
-				rec.RightValue = rs[i].Value
-			case i >= len(rs):
-				rec.Change = "removed"
-				rec.LeftValue = ls[i].Value
-			default:
-				lb, _ := json.Marshal(ls[i].Value)
-				rb, _ := json.Marshal(rs[i].Value)
-				if string(lb) == string(rb) {
-					rec.Change = "unchanged"
-					rec.LeftValue = ls[i].Value
-					rec.RightValue = rs[i].Value
-				} else {
-					rec.Change = "changed"
-					rec.LeftValue = ls[i].Value
-					rec.RightValue = rs[i].Value
-				}
-			}
-			changes = append(changes, rec)
-		}
+		changes = append(changes, pairBucket(ls, rs, ambiguous)...)
 	}
 	sort.Slice(changes, func(i, j int) bool {
 		if changes[i].Key != changes[j].Key {
 			return changes[i].Key < changes[j].Key
 		}
+		if changes[i].Copy != changes[j].Copy {
+			return changes[i].Copy < changes[j].Copy
+		}
 		return changes[i].Change < changes[j].Change
 	})
-	// Page over the change list; store the full list when it overflows.
-	pageN, records, err := pageByBudget(changes, a.pageSize(in.ResponseOptions), a.maxBytes(in.ResponseOptions))
+	// The returned set is decided BEFORE paging: when unchanged
+	// records are not requested they must not consume page capacity
+	// or leak back through get_result_page. UnchangedCount below is
+	// still computed over the full comparison.
+	returned := changes
+	if !in.IncludeUnchanged {
+		returned = nil
+		for _, c := range changes {
+			if c.Change != "unchanged" {
+				returned = append(returned, c)
+			}
+		}
+	}
+	pageN, records, err := pageByBudget(returned, a.pageSize(in.ResponseOptions), a.maxBytes(in.ResponseOptions))
 	if err != nil {
 		return fail("EXTRACTION_FAILED", err.Error())
 	}
-	page := changes[:pageN]
-	if pageN < len(changes) {
+	page := returned[:pageN]
+	if pageN < len(returned) {
 		m, err := a.Store.SaveRecords(records)
 		if err != nil {
 			return fail(storeErrorCode(err), err.Error())

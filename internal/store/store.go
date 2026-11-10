@@ -15,6 +15,8 @@
 package store
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -27,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alfa-reza/exiftool-mcp-go/internal/meta"
 )
@@ -71,26 +74,56 @@ type ResultMeta struct {
 
 // ScanJob is the persisted checkpoint of one search scan.
 type ScanJob struct {
-	ID         string           `json:"id"`
-	ResultID   string           `json:"result_id"`
-	QueryJSON  json.RawMessage  `json:"query"`
-	SpecJSON   json.RawMessage  `json:"spec"`
-	ReturnTags []string         `json:"return_tags,omitempty"`
-	CreatedAt  time.Time        `json:"created_at"`
-	ExpiresAt  time.Time        `json:"expires_at"`
-	Candidates []meta.Candidate `json:"candidates"`
-	NextIndex  int              `json:"next_index"`
+	ID         string          `json:"id"`
+	ResultID   string          `json:"result_id"`
+	QueryJSON  json.RawMessage `json:"query"`
+	SpecJSON   json.RawMessage `json:"spec"`
+	ReturnTags []string        `json:"return_tags,omitempty"`
+	// TimeContext is the timezone assumption the scan was started
+	// with. A resume must reuse it: accepting a different (or no)
+	// assumption on resume would silently change verdicts mid-scan.
+	TimeContext string `json:"time_context,omitempty"`
+	// HasTimeContext records whether a time_context was supplied at
+	// all when the scan started, so a resume cannot ADD one to a
+	// scan that began without it. (Checkpoints written before this
+	// field existed are recognized by TimeContext != "".)
+	HasTimeContext bool             `json:"has_time_context,omitempty"`
+	CreatedAt      time.Time        `json:"created_at"`
+	ExpiresAt      time.Time        `json:"expires_at"`
+	Candidates     []meta.Candidate `json:"candidates"`
+	NextIndex      int              `json:"next_index"`
 	// CommittedRecords is the number of result records written by
 	// committed batches. On resume it is reconciled with the result
-	// store: a mismatch means a crash mid-commit and is reported as
-	// CHECKPOINT_CORRUPT instead of silently duplicating records.
-	CommittedRecords int  `json:"committed_records"`
-	Processed        int  `json:"processed"`
-	Matched          int  `json:"matched"`
-	NoMatch          int  `json:"no_match"`
-	Indet            int  `json:"indeterminate"`
-	Errors           int  `json:"errors"`
-	Done             bool `json:"done"`
+	// store. Records ahead of the checkpoint mean a crash between
+	// appending a batch and saving the checkpoint; those records
+	// are rolled back and the batch is reprocessed, because the
+	// batch's other outcomes (no-matches, per-file errors) were
+	// never persisted and adopting the records would corrupt the
+	// counts. Fewer records than the checkpoint claims is genuine
+	// corruption.
+	CommittedRecords int `json:"committed_records"`
+	Processed        int `json:"processed"`
+	Matched          int `json:"matched"`
+	NoMatch          int `json:"no_match"`
+	Indet            int `json:"indeterminate"`
+	Errors           int `json:"errors"`
+	// EnumErrors counts input paths that produced no candidates at
+	// enumeration time (details ride in ErrorDetails). A scan with
+	// enumeration errors is never reported as fully complete: part
+	// of the requested input was never examined.
+	EnumErrors int  `json:"enum_errors,omitempty"`
+	Done       bool `json:"done"`
+	// ErrorDetails persists the per-file errors of all batches (the
+	// exact total is Errors; details are capped by the tools layer),
+	// so a resumed scan still reports why earlier files failed.
+	ErrorDetails []ScanError `json:"error_details,omitempty"`
+}
+
+// ScanError is one persisted per-file scan error.
+type ScanError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Path    string `json:"path,omitempty"`
 }
 
 // Store is a disk-backed result store.
@@ -184,8 +217,44 @@ func (s *Store) newMeta(kind Kind) *ResultMeta {
 	}
 }
 
+// ensureCapacity guarantees room for add more bytes of store data.
+// The caller must hold s.mu: the capacity check and the write it
+// guards have to be one atomic step, or concurrent writers can each
+// pass the check and overshoot the quota together. When the
+// projected usage exceeds the quota it runs a cleanup that evicts
+// completed results until the pending write fits — eviction is
+// driven by the size of the write that needs room, not only by
+// usage already over the limit. If the data still does not fit,
+// ErrFull is returned.
+func (s *Store) ensureCapacity(add int64) error {
+	if s.quota <= 0 || add <= 0 {
+		return nil
+	}
+	if s.TotalBytes()+add <= s.quota {
+		return nil
+	}
+	_, _ = s.cleanup(add)
+	if s.TotalBytes()+add > s.quota {
+		return fmt.Errorf("%w: %d bytes do not fit in the %d-byte quota", ErrFull, add, s.quota)
+	}
+	return nil
+}
+
+func recordsBytes(records []json.RawMessage) int64 {
+	var n int64
+	for _, r := range records {
+		n += int64(len(r)) + 1
+	}
+	return n
+}
+
 // SaveRecords stores a complete list of JSON records.
 func (s *Store) SaveRecords(records []json.RawMessage) (*ResultMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureCapacity(recordsBytes(records)); err != nil {
+		return nil, err
+	}
 	m := s.newMeta(KindRecords)
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
@@ -241,6 +310,9 @@ func (s *Store) appendSegment(m *ResultMeta, records []json.RawMessage) (string,
 func (s *Store) AppendRecords(id string, records []json.RawMessage) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureCapacity(recordsBytes(records)); err != nil {
+		return nil, err
+	}
 	m, err := s.LoadMeta(id)
 	if err != nil {
 		return nil, err
@@ -252,6 +324,77 @@ func (s *Store) AppendRecords(id string, records []json.RawMessage) (*ResultMeta
 		return nil, err
 	}
 	return m, nil
+}
+
+// TruncateRecords drops every record after the first keep ones. It
+// is the rollback half of the scan commit protocol: records that a
+// crashed batch appended but its checkpoint never counted are
+// removed so the batch can be reprocessed cleanly, with its
+// no-matches and per-file errors re-derived instead of guessed.
+// The surviving records are rewritten into a single fresh segment
+// and the meta is switched to it before the old segments are
+// deleted, so a crash mid-truncate leaves orphan files, never a
+// dangling reference.
+func (s *Store) TruncateRecords(id string, keep int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.LoadMeta(id)
+	if err != nil {
+		return err
+	}
+	if m.Kind != KindRecords {
+		return fmt.Errorf("%w: result %s holds %s, not records", ErrCorrupt, id, m.Kind)
+	}
+	if keep < 0 || keep > m.TotalRecords {
+		return fmt.Errorf("%w: cannot truncate %d records to %d", ErrCorrupt, m.TotalRecords, keep)
+	}
+	if keep == m.TotalRecords {
+		return nil
+	}
+	var lines []string
+	remaining := keep
+	for _, seg := range m.Segments {
+		if remaining == 0 {
+			break
+		}
+		data, err := os.ReadFile(filepath.Join(s.resultDir(id), seg.File))
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrCorrupt, err)
+		}
+		segLines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+		if len(segLines) != seg.Records {
+			return fmt.Errorf("%w: segment %s record count mismatch", ErrCorrupt, seg.File)
+		}
+		take := min(remaining, len(segLines))
+		lines = append(lines, segLines[:take]...)
+		remaining -= take
+	}
+	old := m.Segments
+	m.Segments = nil
+	m.TotalBytes = 0
+	if keep > 0 {
+		var buf bytes.Buffer
+		for _, line := range lines {
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+		}
+		name := "seg-trunc.jsonl"
+		if err := writeAtomic(filepath.Join(s.resultDir(id), name), buf.Bytes()); err != nil {
+			return err
+		}
+		m.Segments = []Segment{{File: name, Records: keep, Bytes: int64(buf.Len())}}
+		m.TotalBytes = int64(buf.Len())
+	}
+	m.TotalRecords = keep
+	if err := s.saveMeta(m); err != nil {
+		return err
+	}
+	for _, seg := range old {
+		if len(m.Segments) == 0 || seg.File != m.Segments[0].File {
+			_ = os.Remove(filepath.Join(s.resultDir(id), seg.File))
+		}
+	}
+	return nil
 }
 
 // MarkComplete flags a result as fully written.
@@ -268,6 +411,11 @@ func (s *Store) MarkComplete(id string) error {
 
 // SaveBlob stores a binary payload.
 func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureCapacity(int64(len(data))); err != nil {
+		return nil, err
+	}
 	m := s.newMeta(KindBinary)
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
@@ -287,6 +435,11 @@ func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 
 // SaveText stores a text payload.
 func (s *Store) SaveText(text string) (*ResultMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureCapacity(int64(len(text))); err != nil {
+		return nil, err
+	}
 	m := s.newMeta(KindText)
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
@@ -327,6 +480,12 @@ func (s *Store) RecordsPage(id string, offset, pageSize int, maxBytes int) (*Res
 	page := &Page{}
 	skip := offset
 	var used int
+	// Records are consumed strictly in order. Reaching the page size
+	// or the byte budget ends the whole page: continuing into the next
+	// segment after a mid-segment stop would skip the unconsumed
+	// records of the current segment while the cursor (derived from
+	// the returned count) advances past them, losing them forever.
+segments:
 	for _, seg := range m.Segments {
 		if pageSize > 0 && len(page.Records) >= pageSize {
 			break
@@ -349,10 +508,10 @@ func (s *Store) RecordsPage(id string, offset, pageSize int, maxBytes int) (*Res
 				continue
 			}
 			if pageSize > 0 && len(page.Records) >= pageSize {
-				break
+				break segments
 			}
 			if maxBytes > 0 && len(page.Records) > 0 && used+len(line) > maxBytes {
-				break
+				break segments
 			}
 			page.Records = append(page.Records, json.RawMessage(line))
 			used += len(line)
@@ -390,6 +549,9 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 	if _, err := f.Seek(offset, 0); err != nil {
 		return nil, nil, 0, err
 	}
+	if maxBytes <= 0 {
+		return nil, nil, 0, fmt.Errorf("%w: fragment size must be positive", ErrCorrupt)
+	}
 	buf := make([]byte, maxBytes)
 	n, err := f.Read(buf)
 	if err != nil && n == 0 {
@@ -398,6 +560,24 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 	chunk := buf[:n]
 	if m.Kind == KindText {
 		chunk = trimToUTF8Boundary(chunk, offset+int64(n) < m.TotalBytes)
+		if len(chunk) == 0 && n > 0 {
+			// The byte budget is smaller than the next code point.
+			// Return the complete code point anyway so the cursor
+			// always advances and paging can never stall. ReadAt
+			// reports io.EOF when the code point ends the payload;
+			// the bytes it did read are the ones that matter, so
+			// the error must not discard them.
+			ext := make([]byte, 4)
+			if rn, _ := f.ReadAt(ext, offset); rn > 0 {
+				if _, size := utf8.DecodeRune(ext[:rn]); size > 0 && size <= rn {
+					chunk = ext[:size]
+				} else {
+					// The payload itself ends mid-rune (corrupt);
+					// return one byte so the cursor still advances.
+					chunk = ext[:1]
+				}
+			}
+		}
 	}
 	return m, chunk, offset + int64(len(chunk)), nil
 }
@@ -449,11 +629,25 @@ func (s *Store) CreateScan(job *ScanJob) error {
 	return s.SaveScan(job)
 }
 
-// SaveScan atomically persists a scan job checkpoint.
+// SaveScan atomically persists a scan job checkpoint. Checkpoints
+// count toward the store quota like any other payload; only the
+// growth over the previous checkpoint is charged, so re-saving a
+// same-size checkpoint never fails on its own bytes.
 func (s *Store) SaveScan(job *ScanJob) error {
 	data, err := json.Marshal(job)
 	if err != nil {
 		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var existing int64
+	if fi, err := os.Stat(s.scanPath(job.ID)); err == nil {
+		existing = fi.Size()
+	}
+	if growth := int64(len(data)) - existing; growth > 0 {
+		if err := s.ensureCapacity(growth); err != nil {
+			return err
+		}
 	}
 	return writeAtomic(s.scanPath(job.ID), data)
 }
@@ -480,20 +674,118 @@ func (s *Store) LoadScan(id string) (*ScanJob, error) {
 	return &job, nil
 }
 
+const (
+	// lockHeartbeat refreshes a held scan lock's mtime; lockStaleAfter
+	// is how long a heartbeat may be silent before the holder is
+	// considered crashed and the lock is taken over.
+	lockHeartbeat  = 10 * time.Second
+	lockStaleAfter = 45 * time.Second
+)
+
+// readLockToken returns the ownership token stored in a scan lock
+// file, or "" when it cannot be read.
+func readLockToken(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// LockScan acquires the cross-process lock for one scan and returns
+// its release function. The mutex in the tools layer serializes
+// batches inside one server process; this lock extends the same
+// guarantee to two server processes sharing one store directory —
+// without it, both could run the same batch and duplicate records.
+// The lock is a file created exclusively inside the scan's
+// directory, containing a unique ownership token; a heartbeat keeps
+// its mtime fresh while held, and a lock whose heartbeat has
+// stopped is taken over. The heartbeat and the release verify the
+// token before touching the file: after a takeover the file belongs
+// to the successor, and the stale owner must neither refresh nor
+// delete it. Waiting honors ctx cancellation.
+func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
+	if !validID(id) {
+		return nil, ErrNotFound
+	}
+	dir := filepath.Join(s.dir, "scans", id)
+	if _, err := os.Stat(dir); err != nil {
+		return nil, ErrNotFound
+	}
+	path := filepath.Join(dir, "job.lock")
+	token := fmt.Sprintf("%d-%s", os.Getpid(), newID())
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = f.WriteString(token)
+			_ = f.Close()
+			stop := make(chan struct{})
+			go func() {
+				tick := time.NewTicker(lockHeartbeat)
+				defer tick.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+						if readLockToken(path) != token {
+							return // taken over; stop refreshing
+						}
+						now := s.now()
+						_ = os.Chtimes(path, now, now)
+					}
+				}
+			}()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					close(stop)
+					if readLockToken(path) == token {
+						_ = os.Remove(path)
+					}
+				})
+			}, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if fi, err := os.Stat(path); err == nil && s.now().Sub(fi.ModTime()) > lockStaleAfter {
+			_ = os.Remove(path)
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 // Cleanup removes expired results and scans, then enforces the disk
-// quota by deleting the oldest completed results first. It returns the
-// number of removed entries.
+// quota by deleting the oldest completed results first. It returns
+// the number of removed entries.
 func (s *Store) Cleanup() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cleanup(0)
+}
+
+// cleanup is Cleanup with a reservation: eviction frees enough room
+// for need additional bytes, not merely enough to get back under
+// the quota — a write that arrives while usage sits just below the
+// limit must still be able to displace old completed results. Only
+// completed results are eviction candidates; incomplete ones belong
+// to work in flight and leave through expiry. The caller must hold
+// s.mu.
+func (s *Store) cleanup(need int64) (int, error) {
 	removed := 0
 	now := s.now()
 	type aged struct {
 		id      string
 		created time.Time
 		size    int64
-		done    bool
 	}
 	var results []aged
-	var total int64
 	entries, _ := os.ReadDir(filepath.Join(s.dir, "results"))
 	for _, e := range entries {
 		if !e.IsDir() || !validID(e.Name()) {
@@ -501,7 +793,14 @@ func (s *Store) Cleanup() (int, error) {
 		}
 		m, err := s.LoadMetaIgnoringExpiry(e.Name())
 		if err != nil {
-			// Corrupt or unreadable metadata: remove the orphan.
+			// Corrupt or unreadable metadata: remove the orphan —
+			// unless the directory is brand new, in which case a
+			// concurrent CreateResult may not have written its
+			// meta.json yet (cleanup now also runs mid-flight, when
+			// a write hits the quota).
+			if info, ierr := e.Info(); ierr == nil && time.Since(info.ModTime()) < time.Minute {
+				continue
+			}
 			_ = os.RemoveAll(s.resultDir(e.Name()))
 			removed++
 			continue
@@ -513,13 +812,14 @@ func (s *Store) Cleanup() (int, error) {
 		}
 		var sz int64
 		_ = filepath.Walk(s.resultDir(e.Name()), func(_ string, info os.FileInfo, err error) error {
-			if err == nil {
+			if err == nil && !info.IsDir() {
 				sz += info.Size()
 			}
 			return nil
 		})
-		results = append(results, aged{id: e.Name(), created: m.CreatedAt, size: sz, done: m.Complete})
-		total += sz
+		if m.Complete {
+			results = append(results, aged{id: e.Name(), created: m.CreatedAt, size: sz})
+		}
 	}
 	scans, _ := os.ReadDir(filepath.Join(s.dir, "scans"))
 	for _, e := range scans {
@@ -527,34 +827,47 @@ func (s *Store) Cleanup() (int, error) {
 			continue
 		}
 		job, err := s.loadScanIgnoringExpiry(e.Name())
-		if err != nil || now.After(job.ExpiresAt) {
+		if err != nil {
+			// A brand-new directory may belong to a CreateScan
+			// that has not written its job.json yet.
+			if info, ierr := e.Info(); ierr == nil && time.Since(info.ModTime()) < time.Minute {
+				continue
+			}
+			_ = os.RemoveAll(filepath.Join(s.dir, "scans", e.Name()))
+			removed++
+			continue
+		}
+		if now.After(job.ExpiresAt) {
 			_ = os.RemoveAll(filepath.Join(s.dir, "scans", e.Name()))
 			removed++
 		}
 	}
-	if s.quota > 0 && total > s.quota {
-		sort.Slice(results, func(i, j int) bool {
-			if results[i].done != results[j].done {
-				return results[i].done // completed first
+	if s.quota > 0 {
+		total := s.TotalBytes()
+		if total+need > s.quota {
+			sort.Slice(results, func(i, j int) bool {
+				return results[i].created.Before(results[j].created)
+			})
+			for _, r := range results {
+				if total+need <= s.quota {
+					break
+				}
+				_ = os.RemoveAll(s.resultDir(r.id))
+				total -= r.size
+				removed++
 			}
-			return results[i].created.Before(results[j].created)
-		})
-		for _, r := range results {
-			if total <= s.quota {
-				break
-			}
-			_ = os.RemoveAll(s.resultDir(r.id))
-			total -= r.size
-			removed++
 		}
 	}
 	return removed, nil
 }
 
-// TotalBytes reports the current disk usage of stored results.
+// TotalBytes reports the current disk usage of the whole store:
+// results AND scan checkpoints. Checkpoints live outside results/;
+// leaving them out let scan-heavy workloads fill the disk entirely
+// off the quota's books.
 func (s *Store) TotalBytes() int64 {
 	var total int64
-	_ = filepath.Walk(filepath.Join(s.dir, "results"), func(_ string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(s.dir, func(_ string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() {
 			total += info.Size()
 		}

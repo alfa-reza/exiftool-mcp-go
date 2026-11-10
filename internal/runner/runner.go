@@ -22,6 +22,40 @@ import (
 // or executed.
 var ErrNotFound = errors.New("exiftool executable not found")
 
+// Safety limits for captured child output: a pathological read must
+// not exhaust server memory, so output beyond the cap fails the call
+// explicitly instead of buffering without bound. Variables (not
+// constants) so tests can shrink them.
+var (
+	maxStdoutBytes = 256 << 20
+	maxStderrBytes = 4 << 20
+)
+
+// cappedBuffer accumulates up to max bytes; beyond that it keeps
+// draining (and discarding) so the child never blocks on a full pipe.
+type cappedBuffer struct {
+	buf  bytes.Buffer
+	max  int
+	over bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if !c.over {
+		if room := c.max - c.buf.Len(); len(p) > room {
+			if room > 0 {
+				c.buf.Write(p[:room])
+			}
+			c.over = true
+		} else {
+			c.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+func (c *cappedBuffer) Bytes() []byte  { return c.buf.Bytes() }
+
 // Result is the outcome of one exiftool invocation.
 type Result struct {
 	Stdout   []byte
@@ -86,35 +120,53 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) (Result, error) {
 			return Result{}, ctx.Err()
 		}
 	}
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline && r.cfg.CallTimeout > 0 {
+	// The configured per-invocation timeout always applies: a
+	// caller deadline that is LATER than CallTimeout must not
+	// stretch the invocation past its configured limit.
+	// WithTimeout keeps whichever deadline is earlier.
+	if r.cfg.CallTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.cfg.CallTimeout)
 		defer cancel()
 	}
 	full := append(r.configArgs(), args...)
 	cmd := exec.CommandContext(ctx, r.path, full...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := &cappedBuffer{max: maxStdoutBytes}
+	stderr := &cappedBuffer{max: maxStderrBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err := cmd.Run()
 	res := Result{Stdout: stdout.Bytes(), Stderr: stderr.String()}
+	if stderr.over {
+		res.Stderr += "\n[stderr truncated]"
+	}
 	if cmd.ProcessState != nil {
 		res.ExitCode = cmd.ProcessState.ExitCode()
 	}
 	if err != nil {
+		// Cancellation and timeout come first: when CommandContext
+		// kills the process, cmd.Run reports an *exec.ExitError
+		// ("signal: killed"), which must not be mistaken for an
+		// ordinary non-zero exit and fed to the parser as data.
+		if ctx.Err() != nil {
+			return res, ctx.Err()
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
+			if stdout.over {
+				return res, fmt.Errorf("exiftool output exceeded the %d-byte safety limit", maxStdoutBytes)
+			}
 			// Non-zero exit is data, not a Go error: callers decide based
 			// on stdout/stderr (batch reads exit 1 on partial failures).
 			return res, nil
-		}
-		if ctx.Err() != nil {
-			return res, ctx.Err()
 		}
 		if errors.Is(err, exec.ErrNotFound) {
 			return res, fmt.Errorf("%w: %s", ErrNotFound, r.path)
 		}
 		return res, fmt.Errorf("running exiftool: %w", err)
+	}
+	if stdout.over {
+		return res, fmt.Errorf("exiftool output exceeded the %d-byte safety limit", maxStdoutBytes)
 	}
 	return res, nil
 }

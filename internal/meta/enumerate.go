@@ -93,25 +93,69 @@ func Enumerate(paths []string, recursive bool, extensions []string) ([]Candidate
 			for _, e := range entries {
 				child := filepath.Join(abs, e.Name())
 				cfi, err := os.Stat(child)
-				if err != nil || !cfi.Mode().IsRegular() {
+				if err != nil {
+					code := "PATH_NOT_FOUND"
+					if os.IsPermission(err) {
+						code = "PERMISSION_DENIED"
+					}
+					errs = append(errs, EnumError{Path: child, Code: code, Message: err.Error()})
+					continue
+				}
+				if !cfi.Mode().IsRegular() {
 					continue
 				}
 				add(child, cfi)
 			}
 			continue
 		}
-		_ = filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
+		// Resolve a symlinked root before walking: WalkDir examines
+		// the root with Lstat, so a symlink-to-directory root would
+		// otherwise be visited as one non-directory entry and
+		// silently yield zero candidates. Symlinks BELOW the root
+		// are still never descended into.
+		walkRoot := abs
+		if lst, err := os.Lstat(abs); err == nil && lst.Mode()&fs.ModeSymlink != 0 {
+			if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+				walkRoot = resolved
+			}
+		}
+		_ = filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				return nil // skip unreadable entries; read errors surface later per file
+				// A subtree that cannot be traversed is reported,
+				// not silently skipped: a scan that missed files
+				// must not look complete.
+				code := "PATH_NOT_FOUND"
+				if os.IsPermission(err) {
+					code = "PERMISSION_DENIED"
+				}
+				errs = append(errs, EnumError{Path: path, Code: code, Message: err.Error()})
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 			if d.IsDir() {
-				if path != abs && d.Type()&fs.ModeSymlink != 0 {
+				if path != walkRoot && d.Type()&fs.ModeSymlink != 0 {
 					return filepath.SkipDir
 				}
 				return nil
 			}
 			info, err := d.Info()
-			if err != nil || !info.Mode().IsRegular() {
+			if err != nil {
+				errs = append(errs, EnumError{Path: path, Code: "PATH_NOT_FOUND", Message: err.Error()})
+				return nil
+			}
+			if !info.Mode().IsRegular() {
+				// A symlink to a regular file is a candidate,
+				// exactly as in the non-recursive listing above
+				// (which Stats its children). Symlinks to
+				// directories are not followed, and other
+				// non-regular files are skipped.
+				if d.Type()&fs.ModeSymlink != 0 {
+					if target, serr := os.Stat(path); serr == nil && target.Mode().IsRegular() {
+						add(path, target)
+					}
+				}
 				return nil
 			}
 			add(path, info)
