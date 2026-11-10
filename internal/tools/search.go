@@ -266,9 +266,15 @@ func addScanError(job *store.ScanJob, code, message, path string) {
 }
 
 // readFilesIndividually reads files one at a time after a batch
-// read timed out. A file whose individual read fails becomes an
-// error result for that file rather than failing the whole batch,
-// so the scan always advances. Caller cancellation still aborts.
+// read timed out, under the scan call's shared work deadline (ctx):
+// a file gets at most the configured per-invocation timeout within
+// whatever of the deadline remains — the fallback does NOT restart
+// the call's time budget per file. A file whose read fails becomes
+// an error result for that file rather than failing the whole
+// batch. When the work deadline is spent, the files determined so
+// far are returned and the rest of the batch waits for the next
+// call; the caller commits exactly this prefix. Caller cancellation
+// still aborts the call.
 func (a *App) readFilesIndividually(ctx context.Context, files []string, spec meta.ReadSpec) ([]meta.FileResult, error) {
 	out := make([]meta.FileResult, 0, len(files))
 	for _, f := range files {
@@ -276,10 +282,13 @@ func (a *App) readFilesIndividually(ctx context.Context, files []string, spec me
 		res, err := a.Reader.Read(callCtx, []string{f}, spec)
 		cancel()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() == context.Canceled {
 				return nil, ctx.Err()
 			}
 			out = append(out, meta.FileResult{Path: f, Status: "error", Error: err.Error()})
+			if ctx.Err() != nil {
+				break // work deadline spent; the tail waits
+			}
 			continue
 		}
 		out = append(out, res...)
@@ -315,21 +324,23 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	}
 	var callRecords []ScanRecord
 	if budget > 0 {
-		batchCtx, cancel := context.WithTimeout(ctx, batchTime)
+		// ONE work deadline bounds the whole invocation: the batch
+		// attempt and the per-file fallback both live under it, so
+		// max_seconds is a real bound for the call. (The round-2
+		// fallback escaped it with a fresh timeout per file.)
+		workCtx, cancel := context.WithTimeout(ctx, batchTime)
 		defer cancel()
 		batchStart := job.NextIndex
 		batch := job.Candidates[job.NextIndex : job.NextIndex+budget]
 		files := make([]string, len(batch))
 		changed := make([]bool, len(batch))
+		statErrs := make([]error, len(batch))
 		var alive []int
 		for i, c := range batch {
 			files[i] = c.Path
 			fi, err := os.Stat(c.Path)
 			if err != nil {
-				job.Errors++
-				job.Processed++
-				job.NextIndex++
-				addScanError(job, "PATH_NOT_FOUND", err.Error(), c.Path)
+				statErrs[i] = err
 				continue
 			}
 			if fi.Size() != c.Size || !fi.ModTime().Equal(c.ModTime) {
@@ -337,56 +348,76 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 			}
 			alive = append(alive, i)
 		}
+		var results []meta.FileResult
 		if len(alive) > 0 {
 			aliveFiles := make([]string, len(alive))
 			for j, i := range alive {
 				aliveFiles[j] = files[i]
 			}
-			results, err := a.Reader.Read(batchCtx, aliveFiles, spec)
-			if err != nil && batchCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-				// The batch as a whole timed out (the caller's own
-				// context is still alive). One pathological file can
-				// stall every retry of the same batch forever, so
-				// fall back to per-file reads: the batch still makes
-				// progress, and a file that times out on its own
-				// becomes a per-file error instead of a roadblock.
-				results, err = a.readFilesIndividually(ctx, aliveFiles, spec)
+			// The batch attempt gets half the work budget; when it
+			// times out, the per-file fallback works with the other
+			// half under the SAME deadline instead of a new one.
+			attemptCtx, acancel := context.WithTimeout(workCtx, batchTime/2)
+			r, err := a.Reader.Read(attemptCtx, aliveFiles, spec)
+			acancel()
+			if err != nil && attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+				// One pathological file can stall every retry of
+				// the same batch forever; read the files one by
+				// one under the remaining work deadline.
+				r, err = a.readFilesIndividually(workCtx, aliveFiles, spec)
 			}
 			if err != nil {
-				// Nothing from this batch is committed; the checkpoint
-				// still points at its start.
+				// Nothing from this batch is committed; the
+				// checkpoint still points at its start.
 				return fail(errorCode(err), err.Error())
 			}
-			for j, fr := range results {
-				i := alive[j]
+			results = r
+		}
+		// Accounting walks the batch in candidate order and
+		// consumes the results as the prefix they are: if the work
+		// deadline stopped the fallback early, the unprocessed tail
+		// is left for the next call — the watermark never skips it.
+		resIdx := 0
+		for i := range batch {
+			if statErrs[i] != nil {
+				job.Errors++
 				job.Processed++
 				job.NextIndex++
-				if fr.Status == "error" {
-					job.Errors++
-					addScanError(job, "EXTRACTION_FAILED", fr.Error, fr.Path)
-					continue
-				}
-				tri, reason := prepared.Eval(fr.Entries)
-				switch tri {
-				case query.Match:
-					job.Matched++
-					callRecords = append(callRecords, ScanRecord{
-						Path: fr.Path, Status: "match",
-						Values:                filterEntries(fr.Entries, job.ReturnTags),
-						ChangedSinceDiscovery: changed[i],
-						Index:                 batchStart + i,
-					})
-				case query.Indeterminate:
-					job.Indet++
-					callRecords = append(callRecords, ScanRecord{
-						Path: fr.Path, Status: "indeterminate", Reason: reason,
-						Values:                filterEntries(fr.Entries, job.ReturnTags),
-						ChangedSinceDiscovery: changed[i],
-						Index:                 batchStart + i,
-					})
-				default:
-					job.NoMatch++
-				}
+				addScanError(job, "PATH_NOT_FOUND", statErrs[i].Error(), files[i])
+				continue
+			}
+			if resIdx >= len(results) {
+				break
+			}
+			fr := results[resIdx]
+			resIdx++
+			job.Processed++
+			job.NextIndex++
+			if fr.Status == "error" {
+				job.Errors++
+				addScanError(job, "EXTRACTION_FAILED", fr.Error, fr.Path)
+				continue
+			}
+			tri, reason := prepared.Eval(fr.Entries)
+			switch tri {
+			case query.Match:
+				job.Matched++
+				callRecords = append(callRecords, ScanRecord{
+					Path: fr.Path, Status: "match",
+					Values:                filterEntries(fr.Entries, job.ReturnTags),
+					ChangedSinceDiscovery: changed[i],
+					Index:                 batchStart + i,
+				})
+			case query.Indeterminate:
+				job.Indet++
+				callRecords = append(callRecords, ScanRecord{
+					Path: fr.Path, Status: "indeterminate", Reason: reason,
+					Values:                filterEntries(fr.Entries, job.ReturnTags),
+					ChangedSinceDiscovery: changed[i],
+					Index:                 batchStart + i,
+				})
+			default:
+				job.NoMatch++
 			}
 		}
 	}
