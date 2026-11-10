@@ -20,10 +20,12 @@ type ReadSpec struct {
 	FastScanLevel      int      // 0=off, 1=-fast, 2..5=-fast2..-fast5
 }
 
-// selector grammar: Name | Group:Name | Group:All. Names start with a
-// letter and contain letters, digits and underscores. Anything that
-// could be confused with a CLI option or an expression is rejected.
-var selectorRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(:([A-Za-z][A-Za-z0-9_]*|All))?$`)
+// Selector grammar: Name | Group:Name | Group:All. Each segment starts
+// with a letter and contains letters, digits and underscores; a dash
+// may appear between alphanumerics so real group families such as
+// "XMP-dc" work ("XMP-dc:Title"). Anything that could be confused with
+// a CLI option or an expression is rejected.
+var selectorRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*(:([A-Za-z][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*|All))?$`)
 
 // ValidateSelector checks one agent-supplied tag/group selector.
 func ValidateSelector(sel string) error {
@@ -35,6 +37,14 @@ func ValidateSelector(sel string) error {
 	}
 	if !selectorRe.MatchString(sel) {
 		return fmt.Errorf("invalid tag selector %q", sel)
+	}
+	// An unqualified selector becomes the argv element "-" + selector.
+	// If the name is one ExifTool treats as a command-line option, the
+	// process would execute the option instead of selecting the tag,
+	// breaking the read-only boundary. The qualified Group:Name form
+	// can never be an option, so it stays available for such tags.
+	if !strings.Contains(sel, ":") && exiftoolOptionNames[strings.ToLower(sel)] {
+		return fmt.Errorf("tag selector %q collides with an ExifTool option; use the qualified Group:Name form", sel)
 	}
 	return nil
 }
@@ -73,7 +83,10 @@ func (s ReadSpec) Args() []string {
 		args = append(args, "-"+strings.Repeat("e", s.EmbeddedLevel+1))
 	}
 	if s.IncludeDuplicates {
-		args = append(args, "-a")
+		// -G4 adds the copy number to the group so duplicate tags with
+		// the same group and name stay distinct in JSON output; with
+		// plain -a, ExifTool silently drops all but the first of them.
+		args = append(args, "-a", "-G4")
 	}
 	switch s.UnknownTags {
 	case 1:

@@ -231,7 +231,7 @@ func FileResultFromPairs(path string, pairs []Pair) FileResult {
 		if p.Key == "SourceFile" {
 			continue
 		}
-		_, name, _, _ := ParseKey(p.Key)
+		_, name, _, _, _ := ParseKey(p.Key)
 		if isExifToolKey(p.Key, "Error") {
 			if s, ok := p.Value.(string); ok && s != "" {
 				fr.Error = s
