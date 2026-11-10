@@ -293,3 +293,30 @@ func TestValidationLimits(t *testing.T) {
 		t.Fatal("option-like tag should be rejected")
 	}
 }
+
+func TestStringIdentifiersCompareAsText(t *testing.T) {
+	// Two numeric-looking STRINGS compare as text: leading zeros in
+	// identifiers are significant, so "00123" != "123".
+	es := entries("EXIF:SerialNumber", "00123")
+	if got := eval(t, pred("SerialNumber", "eq", "123"), nil, es); got != NoMatch {
+		t.Fatalf("SerialNumber eq \"123\" = %v, want no_match", got)
+	}
+	if got := eval(t, pred("SerialNumber", "eq", "00123"), nil, es); got != Match {
+		t.Fatalf("SerialNumber eq \"00123\" = %v, want match", got)
+	}
+	if got := eval(t, pred("SerialNumber", "ne", "123"), nil, es); got != Match {
+		t.Fatalf("SerialNumber ne \"123\" = %v, want match", got)
+	}
+	// A genuinely numeric query literal still compares numerically
+	// against a numeric-looking string entry.
+	es2 := entries("EXIF:ISO", "3200")
+	if got := eval(t, pred("ISO", "eq", 3200), nil, es2); got != Match {
+		t.Fatalf("ISO eq 3200 = %v, want match", got)
+	}
+	// An explicit value_type opts back into numeric comparison.
+	n := pred("SerialNumber", "eq", "123")
+	n.ValueType = "number"
+	if got := eval(t, n, nil, es); got != Match {
+		t.Fatalf("SerialNumber eq \"123\" with value_type=number = %v, want match", got)
+	}
+}

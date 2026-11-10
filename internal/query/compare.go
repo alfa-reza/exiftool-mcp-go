@@ -124,9 +124,20 @@ func (p *Prepared) compareEqual(n *pnode, v any) (Tri, string) {
 
 // inferKind picks a comparison kind from the query value and entry value.
 func inferKind(queryVal, entryVal any) string {
-	if _, ok := toNumber(queryVal); ok {
-		if _, ok := toNumber(entryVal); ok {
-			return "number"
+	// Numeric inference requires a genuinely numeric-typed side.
+	// Two strings that merely LOOK numeric stay text: identifiers
+	// such as serial numbers carry significant leading zeros, and
+	// "00123" must not equal "123". A real number on either side —
+	// a JSON query literal, or an entry value ExifTool emitted as
+	// a JSON number — does justify comparing numerically against
+	// a numeric-looking string on the other side.
+	_, qStr := queryVal.(string)
+	_, eStr := entryVal.(string)
+	if !qStr || !eStr {
+		if _, ok := toNumber(queryVal); ok {
+			if _, ok := toNumber(entryVal); ok {
+				return "number"
+			}
 		}
 	}
 	qs, qok := queryVal.(string)
