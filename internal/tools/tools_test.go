@@ -1167,7 +1167,13 @@ func TestReadOversizedValueStoreFailureIsLoud(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "big.jpg")
 	writeJPEG(t, p)
-	cli(t, "-q", "-overwrite_original", "-Comment="+strings.Repeat("x", 40000), p)
+	// The 40 KB value travels in a file (-TAG<=file): passing it as
+	// a command-line argument exceeds the Windows process limit.
+	valueFile := filepath.Join(dir, "comment.txt")
+	if err := os.WriteFile(valueFile, []byte(strings.Repeat("x", 40000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli(t, "-q", "-overwrite_original", "-Comment<="+valueFile, p)
 	storeDir := t.TempDir()
 	cfg := config.Config{
 		StoreDir: storeDir, CallTimeout: 60 * time.Second, MaxConcurrency: 4,
