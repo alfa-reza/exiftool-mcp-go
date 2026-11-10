@@ -60,12 +60,11 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 		out.Errors = append(out.Errors, ToolError{Code: "INVALID_ARGUMENT", Message: "paths must contain at least one path"})
 		return errResult(), out, nil
 	}
-	var include, exclude []string
-	filterMode := "none"
-	if in.MetadataFilter != nil && in.MetadataFilter.Mode == "select" {
-		filterMode = "select"
-		include = in.MetadataFilter.IncludeTags
-		exclude = in.MetadataFilter.ExcludeTags
+	include, exclude, filterMode, ferr := filterSelectors(in.MetadataFilter)
+	if ferr != nil {
+		out.Status = "failed"
+		out.Errors = append(out.Errors, ToolError{Code: "INVALID_ARGUMENT", Message: ferr.Error()})
+		return errResult(), out, nil
 	}
 	spec := in.ReadOptions.Spec(include, exclude)
 	if err := spec.Validate(); err != nil {

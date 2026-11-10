@@ -653,6 +653,174 @@ func TestCompareIntegration(t *testing.T) {
 	}
 }
 
+func TestCompareDuplicateCopyPairing(t *testing.T) {
+	requireExifTool(t)
+	build := func(comments ...string) string {
+		data := jpegBytes(t)
+		com := func(s string) []byte {
+			seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+			return append(seg, s...)
+		}
+		out := append([]byte{}, data[:2]...)
+		for _, c := range comments {
+			out = append(out, com(c)...)
+		}
+		out = append(out, data[2:]...)
+		p := filepath.Join(t.TempDir(), "x.jpg")
+		if err := os.WriteFile(p, out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	left := build("alpha", "beta")
+	right := build("beta") // first copy deleted; "beta" renumbers to copy one
+	app, _ := newTestApp(t, t.TempDir())
+	_, out, err := app.compareMetadata(context.Background(), nil, CompareMetadataIn{
+		LeftPath: left, RightPath: right,
+		MetadataFilter:   &MetadataFilter{Mode: "select", IncludeTags: []string{"Comment"}},
+		ReadOptions:      &ReadOptionsInput{IncludeDuplicates: true},
+		IncludeUnchanged: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The honest diff: alpha was removed, beta is unchanged, and no
+	// value "changed" — positional pairing fabricated exactly that.
+	if len(out.Changed) != 0 {
+		t.Fatalf("no value changed, got %+v", out.Changed)
+	}
+	if len(out.Removed) != 1 || out.Removed[0].LeftValue != "alpha" {
+		t.Fatalf("alpha should be the removal, got %+v", out.Removed)
+	}
+	if len(out.Unchanged) != 1 || out.Unchanged[0].LeftValue != "beta" {
+		t.Fatalf("beta should be unchanged, got %+v", out.Unchanged)
+	}
+}
+
+func TestCompareUnchangedExcludedFromPages(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	_, out, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: filepath.Join(dir, "a.jpg"), RightPath: filepath.Join(dir, "c.jpg"),
+		ResponseOptions: &ResponseOptionsInput{PageSize: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.UnchangedCount == 0 {
+		t.Fatal("expected some unchanged tags between the two Canon photos")
+	}
+	if len(out.Unchanged) != 0 {
+		t.Fatalf("unchanged records leaked into the response: %+v", out.Unchanged)
+	}
+	if out.ResultID == "" {
+		t.Fatal("expected overflow to be stored for paging")
+	}
+	_, page, err := app.Store.RecordsPage(out.ResultID, 0, 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawChange := false
+	for _, raw := range page.Records {
+		var rec ChangeRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Change == "unchanged" {
+			t.Fatalf("unchanged record leaked into the stored result: %+v", rec)
+		}
+		if rec.Change == "changed" {
+			sawChange = true
+		}
+	}
+	if !sawChange {
+		t.Fatal("stored result should contain the ISO change")
+	}
+}
+
+func TestFilterModeTypoRejected(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	a := filepath.Join(dir, "a.jpg")
+	_, out, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:          []string{a},
+		MetadataFilter: &MetadataFilter{Mode: "slect", IncludeTags: []string{"Make"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("mistyped filter mode must be rejected, got %+v", out)
+	}
+	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: a, RightPath: a,
+		MetadataFilter: &MetadataFilter{Mode: "slect"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cout.Status != "failed" || len(cout.Errors) == 0 || cout.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("mistyped filter mode must be rejected in compare, got %+v", cout)
+	}
+}
+
+func TestFastLevelGuardForConclusions(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	a := filepath.Join(dir, "a.jpg")
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q,
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("search with fast_scan_level 3 must be rejected, got %+v", out)
+	}
+	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
+		LeftPath: a, RightPath: a,
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cout.Status != "failed" || len(cout.Errors) == 0 || cout.Errors[0].Code != "INVALID_ARGUMENT" {
+		t.Fatalf("compare with fast_scan_level 4 must be rejected, got %+v", cout)
+	}
+	// A plain read keeps the option: the caller asked for the
+	// extraction itself, and the effective options disclose it.
+	_, rout, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:       []string{a},
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rout.Status == "failed" {
+		t.Fatalf("plain read with fast_scan_level 3 should not be rejected: %+v", rout)
+	}
+}
+
+func TestSearchTagCaseInsensitive(t *testing.T) {
+	dir := setupPhotos(t)
+	app, _ := newTestApp(t, t.TempDir())
+	q := &query.Node{Type: "predicate", Tag: "make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{
+		Paths: []string{dir}, Query: q, ScanOptions: &ScanOptionsInput{MaxFiles: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.MatchedCount != 2 {
+		t.Fatalf("lowercase tag should match both Canon photos: %+v", out)
+	}
+}
+
 func TestDiscoverIntegration(t *testing.T) {
 	dir := setupPhotos(t)
 	app, _ := newTestApp(t, t.TempDir())

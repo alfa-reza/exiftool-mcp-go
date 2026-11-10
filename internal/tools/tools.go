@@ -74,6 +74,33 @@ func (o *ReadOptionsInput) Spec(include, exclude []string) meta.ReadSpec {
 	return s
 }
 
+// filterSelectors resolves a MetadataFilter into include/exclude
+// selectors. An unrecognized mode is a caller error: silently
+// ignoring a mistyped mode ("slect") would return unfiltered
+// metadata the caller explicitly tried to restrict.
+func filterSelectors(f *MetadataFilter) (include, exclude []string, mode string, err error) {
+	if f == nil || f.Mode == "" || f.Mode == "none" {
+		return nil, nil, "none", nil
+	}
+	if f.Mode == "select" {
+		return f.IncludeTags, f.ExcludeTags, "select", nil
+	}
+	return nil, nil, "", fmt.Errorf("metadata_filter.mode %q is not supported (use \"none\" or \"select\")", f.Mode)
+}
+
+// guardFastLevel rejects read options whose extraction level cannot
+// support conclusions. At fast_scan_level >= 3 ExifTool extracts no
+// metadata at all (system tags only), so a query verdict or a diff
+// computed over such a read would mistake "not read" for "not
+// present". Plain reads keep the option: there the caller asked for
+// the extraction itself, and the effective options disclose it.
+func guardFastLevel(spec meta.ReadSpec) error {
+	if spec.FastScanLevel >= 3 {
+		return fmt.Errorf("fast_scan_level %d extracts no metadata and cannot support conclusions about tag presence or values", spec.FastScanLevel)
+	}
+	return nil
+}
+
 // ResponseOptionsInput controls paging of a tool response.
 type ResponseOptionsInput struct {
 	PageSize         int `json:"page_size,omitempty"`

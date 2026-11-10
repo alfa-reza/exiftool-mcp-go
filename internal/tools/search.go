@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -143,6 +144,9 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 	if err := spec.Validate(); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
+	if err := guardFastLevel(spec); err != nil {
+		return fail("INVALID_ARGUMENT", err.Error())
+	}
 	candidates, enumErrs := meta.Enumerate(in.Paths, in.Recursive, in.Extensions)
 	for _, e := range enumErrs {
 		out.Errors = append(out.Errors, ToolError{Code: e.Code, Message: e.Message, Path: e.Path})
@@ -219,6 +223,9 @@ func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallT
 	var spec meta.ReadSpec
 	if err := json.Unmarshal(job.SpecJSON, &spec); err != nil {
 		return fail("CHECKPOINT_CORRUPT", err.Error())
+	}
+	if err := guardFastLevel(spec); err != nil {
+		return fail("INVALID_ARGUMENT", err.Error())
 	}
 	out.EffectiveOptions = spec.Describe()
 	return a.runSearchBatch(ctx, in, job, prepared, spec, out)
@@ -494,7 +501,8 @@ func filterEntries(entries []meta.Entry, selectors []string) []meta.Entry {
 }
 
 // selectorMatches mirrors the query package's selector semantics for
-// shaping return values.
+// shaping return values (tag and group names are case-insensitive,
+// as ExifTool resolves them).
 func selectorMatches(e meta.Entry, sel string) bool {
 	group, name := "", sel
 	for i := 0; i < len(sel); i++ {
@@ -503,15 +511,15 @@ func selectorMatches(e meta.Entry, sel string) bool {
 			break
 		}
 	}
-	if name != "All" && e.Name != name {
+	if !strings.EqualFold(name, "All") && !strings.EqualFold(e.Name, name) {
 		return false
 	}
-	if group == "" || e.Group == group {
+	if group == "" || strings.EqualFold(e.Group, group) {
 		return true
 	}
 	// Any family segment may be used to reference the group.
 	for _, seg := range splitColon(e.Group) {
-		if seg == group {
+		if strings.EqualFold(seg, group) {
 			return true
 		}
 	}
