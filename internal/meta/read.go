@@ -71,6 +71,7 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 			if p.Key == "SourceFile" {
 				if s, ok := p.Value.(string); ok {
 					bySource[s] = obj
+					bySource[pathKey(s)] = obj
 				}
 			}
 		}
@@ -85,6 +86,11 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 			}
 		}
 		if obj == nil {
+			// Slash styles differ across platforms (Windows ExifTool
+			// echoes forward slashes); correlate on the normalized form.
+			obj = bySource[pathKey(f)]
+		}
+		if obj == nil {
 			out = append(out, FileResult{Path: f, Status: "error",
 				Error: "no output from exiftool for this file"})
 			continue
@@ -95,13 +101,23 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 	return out, nil
 }
 
+// pathKey normalizes a path for correlation between requested files
+// and ExifTool's own path echo: on Windows ExifTool reports paths
+// with forward slashes while callers pass backslashes, so correlation
+// must not depend on the slash style. (filepath.ToSlash would be a
+// no-op on Unix, so the replacement is unconditional; the exact path
+// is always tried first, this is only an additional index key.)
+func pathKey(p string) string {
+	return strings.ReplaceAll(p, "\\", "/")
+}
+
 // applyStderrDiagnostics correlates stderr diagnostics with files.
 //
 // When tags are selected, ExifTool omits the Error field from the JSON
 // object of a failed file and reports "Error: <msg> - <operand>" on
 // stderr instead (verified against ExifTool 13.55). The operand is
-// echoed verbatim, so an exact suffix match is a certain correlation,
-// not a guess. Warnings are merged the same way.
+// echoed after the last " - " separator; it is matched exactly or in
+// normalized slash form (Windows echo style), never by guessing.
 func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 	if stderr == "" {
 		return
@@ -109,6 +125,9 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 	type diag struct{ errors, warnings []string }
 	byOperand := make(map[string]*diag)
 	for _, line := range strings.Split(stderr, "\n") {
+		// Windows child output ends lines with CRLF; a trailing \r
+		// would poison the operand comparison.
+		line = strings.TrimSuffix(line, "\r")
 		var kind, rest string
 		switch {
 		case strings.HasPrefix(line, "Error: "):
@@ -118,16 +137,19 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 		default:
 			continue
 		}
+		idx := strings.LastIndex(rest, " - ")
+		if idx < 0 {
+			continue
+		}
+		msg, tail := rest[:idx], rest[idx+3:]
 		for _, f := range files {
 			op, err := runner.Operand(f)
 			if err != nil {
 				continue
 			}
-			suffix := " - " + op
-			if !strings.HasSuffix(rest, suffix) {
+			if tail != op && tail != f && pathKey(tail) != pathKey(op) && pathKey(tail) != pathKey(f) {
 				continue
 			}
-			msg := strings.TrimSuffix(rest, suffix)
 			d := byOperand[f]
 			if d == nil {
 				d = &diag{}
