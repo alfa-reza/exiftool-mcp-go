@@ -48,6 +48,11 @@ type ReadMetadataOut struct {
 // text fragments instead of inlining them into the response.
 const largeValueThreshold = 32 << 10
 
+// readChunkFiles bounds how many files one streaming step of
+// read_metadata processes (the reader itself invokes ExifTool in
+// smaller chunks).
+const readChunkFiles = 200
+
 func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadMetadataIn) (*mcp.CallToolResult, ReadMetadataOut, error) {
 	out := ReadMetadataOut{Status: "complete", Complete: true}
 	if len(in.Paths) == 0 {
@@ -76,71 +81,110 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 	for i, c := range candidates {
 		files[i] = c.Path
 	}
-	var results []meta.FileResult
-	if len(files) > 0 {
-		var err error
-		results, err = a.Reader.Read(ctx, files, spec)
+	// Files are processed in chunks and the response page is filled
+	// incrementally; results beyond the page are appended to the
+	// result store chunk by chunk. A read of a huge directory never
+	// holds more than one chunk plus the first page in memory.
+	pageLimit := a.pageSize(in.ResponseOptions)
+	byteBudget := a.maxBytes(in.ResponseOptions)
+	var pageItems []meta.FileResult
+	var pageRecords []json.RawMessage
+	pageBytes := 0
+	var stored *store.ResultMeta
+	processed, errorCount := 0, 0
+	failWith := func(code, msg string) (*mcp.CallToolResult, ReadMetadataOut, error) {
+		out.Status = "failed"
+		out.Errors = append(out.Errors, ToolError{Code: code, Message: msg})
+		return errResult(), out, nil
+	}
+	for start := 0; start < len(files); start += readChunkFiles {
+		chunk := files[start:min(start+readChunkFiles, len(files))]
+		results, err := a.Reader.Read(ctx, chunk, spec)
 		if err != nil {
-			out.Status = "failed"
-			out.Errors = append(out.Errors, ToolError{Code: errorCode(err), Message: err.Error()})
-			return errResult(), out, nil
+			return failWith(errorCode(err), err.Error())
 		}
-	}
-	out.ProcessedCount = len(results)
-	// Move oversized values into the store as text fragments.
-	for i := range results {
-		for j := range results[i].Entries {
-			e := &results[i].Entries[j]
-			raw, err := json.Marshal(e.Value)
-			if err != nil || len(raw) <= largeValueThreshold {
-				continue
+		// Move oversized values into the store as text fragments.
+		for i := range results {
+			for j := range results[i].Entries {
+				e := &results[i].Entries[j]
+				raw, err := json.Marshal(e.Value)
+				if err != nil || len(raw) <= largeValueThreshold {
+					continue
+				}
+				text := string(raw)
+				if s, ok := e.Value.(string); ok {
+					text = s
+				}
+				m, err := a.Store.SaveText(text)
+				if err != nil {
+					continue // leave value inline rather than dropping it
+				}
+				e.ValueRef = &meta.ValueRef{ResultID: m.ID, Kind: string(store.KindText), Size: int64(len(text))}
+				e.Value = nil
+				e.ValueOmitted = true
 			}
-			text := string(raw)
-			if s, ok := e.Value.(string); ok {
-				text = s
+		}
+		processed += len(results)
+		for _, r := range results {
+			if r.Status == "error" {
+				errorCount++
 			}
-			m, err := a.Store.SaveText(text)
+		}
+		records, err := marshalRecords(results)
+		if err != nil {
+			return failWith("EXTRACTION_FAILED", err.Error())
+		}
+		if stored != nil {
+			if _, err := a.Store.AppendRecords(stored.ID, records); err != nil {
+				return failWith(storeErrorCode(err), err.Error())
+			}
+			continue
+		}
+		// Fill the first page from this chunk; the first record that
+		// does not fit starts the stored overflow.
+		take := 0
+		for take < len(results) {
+			if len(pageItems) >= pageLimit {
+				break
+			}
+			if len(pageItems) > 0 && pageBytes+len(records[take]) > byteBudget {
+				break
+			}
+			pageItems = append(pageItems, results[take])
+			pageRecords = append(pageRecords, records[take])
+			pageBytes += len(records[take])
+			take++
+		}
+		if take < len(results) {
+			// Overflow: store the complete result set, page prefix
+			// first, so cursor offsets line up with the whole set.
+			m, err := a.Store.CreateResult(store.KindRecords)
 			if err != nil {
-				continue // leave value inline rather than dropping it
+				return failWith(storeErrorCode(err), err.Error())
 			}
-			e.ValueRef = &meta.ValueRef{ResultID: m.ID, Kind: string(store.KindText), Size: int64(len(text))}
-			e.Value = nil
-			e.ValueOmitted = true
+			stored = m
+			all := append(pageRecords, records[take:]...)
+			if _, err := a.Store.AppendRecords(stored.ID, all); err != nil {
+				return failWith(storeErrorCode(err), err.Error())
+			}
 		}
 	}
-	errorCount := 0
-	for _, r := range results {
-		if r.Status == "error" {
-			errorCount++
-		}
-	}
-	if len(results) == 0 || errorCount == len(results) && len(results) > 0 {
+	out.ProcessedCount = processed
+	if processed == 0 || (errorCount == processed && processed > 0) {
 		if len(enumErrs) > 0 || errorCount > 0 {
 			out.Status = "failed"
 		}
 	} else if errorCount > 0 || len(enumErrs) > 0 {
 		out.Status = "partial"
 	}
-	// Page the results; overflow goes to the result store.
-	pageN, records, err := pageByBudget(results, a.pageSize(in.ResponseOptions), a.maxBytes(in.ResponseOptions))
-	if err != nil {
-		out.Status = "failed"
-		out.Errors = append(out.Errors, ToolError{Code: "EXTRACTION_FAILED", Message: err.Error()})
-		return errResult(), out, nil
-	}
-	out.Items = results[:pageN]
-	if pageN < len(results) {
-		m, err := a.Store.SaveRecords(records)
-		if err != nil {
-			out.Status = "failed"
-			out.Errors = append(out.Errors, ToolError{Code: storeErrorCode(err), Message: err.Error()})
-			return errResult(), out, nil
-		}
-		out.ResultID = m.ID
-		out.NextCursor = encodeCursor(pageN)
+	out.Items = pageItems
+	if stored != nil {
+		_ = a.Store.MarkComplete(stored.ID)
+		out.ResultID = stored.ID
+		out.NextCursor = encodeCursor(len(pageItems))
 		out.HasMore = true
 		out.Complete = false
-		out.ExpiresAt = m.ExpiresAt.Format(time.RFC3339)
+		out.ExpiresAt = stored.ExpiresAt.Format(time.RFC3339)
 	}
 	eff := spec.Describe()
 	eff["filter_mode"] = filterMode

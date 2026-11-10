@@ -101,9 +101,15 @@ func (a *App) getResultPage(ctx context.Context, _ *mcp.CallToolRequest, in GetR
 		if size <= 0 {
 			size = a.Cfg.DefaultPageSize
 		}
+		if size > 1000 {
+			size = 1000
+		}
 		maxB := in.MaxBytes
 		if maxB <= 0 {
 			maxB = 256 << 10
+		}
+		if maxB > 4<<20 {
+			maxB = 4 << 20
 		}
 		_, page, err := a.Store.RecordsPage(in.ResultID, offset, size, maxB)
 		if err != nil {

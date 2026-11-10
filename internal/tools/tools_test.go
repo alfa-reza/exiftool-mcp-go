@@ -512,6 +512,60 @@ func TestReadDuplicatesPreserved(t *testing.T) {
 	}
 }
 
+func TestReadMetadataPagingAcrossChunks(t *testing.T) {
+	// 250 files with a page size of 100: the first page comes from
+	// the first chunk, the rest must be walkable through the stored
+	// result with no record lost or duplicated across chunk and
+	// segment boundaries.
+	requireExifTool(t)
+	dir := t.TempDir()
+	const n = 250
+	for i := 0; i < n; i++ {
+		writeJPEG(t, filepath.Join(dir, fmt.Sprintf("f%03d.jpg", i)))
+	}
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	_, out, err := app.readMetadata(ctx, nil, ReadMetadataIn{
+		Paths:           []string{dir},
+		ResponseOptions: &ResponseOptionsInput{PageSize: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Items) != 100 || !out.HasMore || out.ResultID == "" || out.ProcessedCount != n {
+		t.Fatalf("first page wrong: items=%d hasMore=%v result=%q processed=%d",
+			len(out.Items), out.HasMore, out.ResultID, out.ProcessedCount)
+	}
+	seen := make(map[string]bool)
+	for _, it := range out.Items {
+		seen[it.Path] = true
+	}
+	cursor := out.NextCursor
+	for cursor != "" {
+		_, page, err := app.getResultPage(ctx, nil, GetResultPageIn{ResultID: out.ResultID, Cursor: cursor, PageSize: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, raw := range page.Items {
+			var fr meta.FileResult
+			if err := json.Unmarshal(raw, &fr); err != nil {
+				t.Fatal(err)
+			}
+			if seen[fr.Path] {
+				t.Fatalf("duplicate across pages: %s", fr.Path)
+			}
+			seen[fr.Path] = true
+		}
+		if !page.HasMore {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != n {
+		t.Fatalf("paged %d of %d files", len(seen), n)
+	}
+}
+
 func TestSearchChangedAndIndeterminate(t *testing.T) {
 	requireExifTool(t)
 	dir := t.TempDir()
