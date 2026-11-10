@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,18 @@ func TestRunTimeoutIsAnErrorNotData(t *testing.T) {
 	_, err := r.Run(context.Background(), "-ver")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestRunOutputLimitEnforced(t *testing.T) {
+	old := maxStdoutBytes
+	maxStdoutBytes = 1024
+	defer func() { maxStdoutBytes = old }()
+	fake := writeFakeExifTool(t, "i=0; while [ $i -lt 5000 ]; do printf x; i=$((i+1)); done\n")
+	r := New(config.Config{ExifToolPath: fake, CallTimeout: 30 * time.Second})
+	_, err := r.Run(context.Background(), "-ver")
+	if err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("expected an output-limit error, got %v", err)
 	}
 }
 

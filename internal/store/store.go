@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alfa-reza/exiftool-mcp-go/internal/meta"
 )
@@ -71,19 +72,19 @@ type ResultMeta struct {
 
 // ScanJob is the persisted checkpoint of one search scan.
 type ScanJob struct {
-	ID         string          `json:"id"`
-	ResultID   string          `json:"result_id"`
-	QueryJSON  json.RawMessage `json:"query"`
-	SpecJSON   json.RawMessage `json:"spec"`
-	ReturnTags []string        `json:"return_tags,omitempty"`
+	ID         string           `json:"id"`
+	ResultID   string           `json:"result_id"`
+	QueryJSON  json.RawMessage  `json:"query"`
+	SpecJSON   json.RawMessage  `json:"spec"`
+	ReturnTags []string         `json:"return_tags,omitempty"`
 	// TimeContext is the timezone assumption the scan was started
 	// with. A resume must reuse it: accepting a different (or no)
 	// assumption on resume would silently change verdicts mid-scan.
-	TimeContext string           `json:"time_context,omitempty"`
-	CreatedAt   time.Time        `json:"created_at"`
-	ExpiresAt   time.Time        `json:"expires_at"`
-	Candidates  []meta.Candidate `json:"candidates"`
-	NextIndex   int              `json:"next_index"`
+	TimeContext string `json:"time_context,omitempty"`
+	CreatedAt  time.Time        `json:"created_at"`
+	ExpiresAt  time.Time        `json:"expires_at"`
+	Candidates []meta.Candidate `json:"candidates"`
+	NextIndex  int              `json:"next_index"`
 	// CommittedRecords is the number of result records written by
 	// committed batches. On resume it is reconciled with the result
 	// store. Records ahead of the checkpoint mean a crash between
@@ -202,8 +203,38 @@ func (s *Store) newMeta(kind Kind) *ResultMeta {
 	}
 }
 
+// ensureCapacity guarantees room for add more bytes of result data.
+// When the projected usage exceeds the quota it first runs a cleanup
+// (expired entries, then oldest completed results) — this is also
+// what enforces the quota while the server keeps running, not only
+// at startup. If the data still does not fit, ErrFull is returned.
+func (s *Store) ensureCapacity(add int64) error {
+	if s.quota <= 0 || add <= 0 {
+		return nil
+	}
+	if s.TotalBytes()+add <= s.quota {
+		return nil
+	}
+	_, _ = s.Cleanup()
+	if s.TotalBytes()+add > s.quota {
+		return fmt.Errorf("%w: %d bytes do not fit in the %d-byte quota", ErrFull, add, s.quota)
+	}
+	return nil
+}
+
+func recordsBytes(records []json.RawMessage) int64 {
+	var n int64
+	for _, r := range records {
+		n += int64(len(r)) + 1
+	}
+	return n
+}
+
 // SaveRecords stores a complete list of JSON records.
 func (s *Store) SaveRecords(records []json.RawMessage) (*ResultMeta, error) {
+	if err := s.ensureCapacity(recordsBytes(records)); err != nil {
+		return nil, err
+	}
 	m := s.newMeta(KindRecords)
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
@@ -259,6 +290,9 @@ func (s *Store) appendSegment(m *ResultMeta, records []json.RawMessage) (string,
 func (s *Store) AppendRecords(id string, records []json.RawMessage) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureCapacity(recordsBytes(records)); err != nil {
+		return nil, err
+	}
 	m, err := s.LoadMeta(id)
 	if err != nil {
 		return nil, err
@@ -286,6 +320,9 @@ func (s *Store) MarkComplete(id string) error {
 
 // SaveBlob stores a binary payload.
 func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
+	if err := s.ensureCapacity(int64(len(data))); err != nil {
+		return nil, err
+	}
 	m := s.newMeta(KindBinary)
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
@@ -305,6 +342,9 @@ func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 
 // SaveText stores a text payload.
 func (s *Store) SaveText(text string) (*ResultMeta, error) {
+	if err := s.ensureCapacity(int64(len(text))); err != nil {
+		return nil, err
+	}
 	m := s.newMeta(KindText)
 	if err := os.MkdirAll(s.resultDir(m.ID), 0o700); err != nil {
 		return nil, err
@@ -414,6 +454,9 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 	if _, err := f.Seek(offset, 0); err != nil {
 		return nil, nil, 0, err
 	}
+	if maxBytes <= 0 {
+		return nil, nil, 0, fmt.Errorf("%w: fragment size must be positive", ErrCorrupt)
+	}
 	buf := make([]byte, maxBytes)
 	n, err := f.Read(buf)
 	if err != nil && n == 0 {
@@ -422,6 +465,17 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 	chunk := buf[:n]
 	if m.Kind == KindText {
 		chunk = trimToUTF8Boundary(chunk, offset+int64(n) < m.TotalBytes)
+		if len(chunk) == 0 && n > 0 {
+			// The byte budget is smaller than the next code point.
+			// Return the complete code point anyway so the cursor
+			// always advances and paging can never stall.
+			ext := make([]byte, 4)
+			if _, err := f.ReadAt(ext, offset); err == nil {
+				if _, size := utf8.DecodeRune(ext); size > 0 {
+					chunk = ext[:size]
+				}
+			}
+		}
 	}
 	return m, chunk, offset + int64(len(chunk)), nil
 }
@@ -525,7 +579,14 @@ func (s *Store) Cleanup() (int, error) {
 		}
 		m, err := s.LoadMetaIgnoringExpiry(e.Name())
 		if err != nil {
-			// Corrupt or unreadable metadata: remove the orphan.
+			// Corrupt or unreadable metadata: remove the orphan —
+			// unless the directory is brand new, in which case a
+			// concurrent CreateResult may not have written its
+			// meta.json yet (cleanup now also runs mid-flight, when
+			// a write hits the quota).
+			if info, ierr := e.Info(); ierr == nil && time.Since(info.ModTime()) < time.Minute {
+				continue
+			}
 			_ = os.RemoveAll(s.resultDir(e.Name()))
 			removed++
 			continue
@@ -537,7 +598,7 @@ func (s *Store) Cleanup() (int, error) {
 		}
 		var sz int64
 		_ = filepath.Walk(s.resultDir(e.Name()), func(_ string, info os.FileInfo, err error) error {
-			if err == nil {
+			if err == nil && !info.IsDir() {
 				sz += info.Size()
 			}
 			return nil

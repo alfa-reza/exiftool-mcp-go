@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -100,6 +101,83 @@ func TestRecordsPageByteBudgetAcrossSegments(t *testing.T) {
 	}
 	if offset != 3 {
 		t.Fatalf("final offset = %d, want 3", offset)
+	}
+}
+
+func TestQuotaEnforcedOnSave(t *testing.T) {
+	s, err := New(t.TempDir(), time.Hour, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveBlob(make([]byte, 600), "application/octet-stream"); err != nil {
+		t.Fatalf("first blob should fit: %v", err)
+	}
+	if _, err := s.SaveBlob(make([]byte, 600), "application/octet-stream"); !errors.Is(err, ErrFull) {
+		t.Fatalf("second blob should exceed the quota: %v", err)
+	}
+	if _, err := s.SaveText(strings.Repeat("x", 600)); !errors.Is(err, ErrFull) {
+		t.Fatalf("oversized text should exceed the quota: %v", err)
+	}
+	if _, err := s.SaveText("tiny"); err != nil {
+		t.Fatalf("small text should still fit: %v", err)
+	}
+	// Appends are enforced too (fresh store so cleanup eviction of
+	// the completed results above cannot make room).
+	s2, err := New(t.TempDir(), time.Hour, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := s2.CreateResult(KindRecords)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := []json.RawMessage{json.RawMessage(strings.Repeat("y", 600))}
+	if _, err := s2.AppendRecords(m.ID, big); err != nil {
+		t.Fatalf("first append should fit: %v", err)
+	}
+	if _, err := s2.AppendRecords(m.ID, big); !errors.Is(err, ErrFull) {
+		t.Fatalf("append past the quota should fail: %v", err)
+	}
+}
+
+func TestTextFragmentAlwaysAdvances(t *testing.T) {
+	// A byte budget smaller than the next UTF-8 code point must still
+	// return that code point whole: an empty chunk with an unmoved
+	// cursor would loop forever.
+	s := newStore(t)
+	text := "\U0001D11Eabc" // 4-byte rune + ASCII
+	m, err := s.SaveText(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, chunk, next, err := s.Fragment(m.ID, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(chunk) != "\U0001D11E" || next != 4 {
+		t.Fatalf("first fragment = %q next=%d, want the full rune and 4", chunk, next)
+	}
+	var out []byte
+	off := int64(0)
+	for i := 0; i < 20; i++ {
+		_, chunk, next, err := s.Fragment(m.ID, off, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next <= off {
+			t.Fatalf("fragment did not advance at offset %d", off)
+		}
+		if !utf8.Valid(chunk) {
+			t.Fatalf("fragment at %d is not valid UTF-8: %q", off, chunk)
+		}
+		out = append(out, chunk...)
+		off = next
+		if off >= int64(len(text)) {
+			break
+		}
+	}
+	if string(out) != text {
+		t.Fatalf("reconstruction = %q, want %q", out, text)
 	}
 }
 
