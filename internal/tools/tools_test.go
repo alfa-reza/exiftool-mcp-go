@@ -775,13 +775,13 @@ func TestFastLevelGuardForConclusions(t *testing.T) {
 	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
 	_, out, err := app.searchMetadata(ctx, nil, SearchMetadataIn{
 		Paths: []string{dir}, Query: q,
-		ReadOptions: &ReadOptionsInput{FastScanLevel: 3},
+		ReadOptions: &ReadOptionsInput{FastScanLevel: 2},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out.Status != "failed" || len(out.Errors) == 0 || out.Errors[0].Code != "INVALID_ARGUMENT" {
-		t.Fatalf("search with fast_scan_level 3 must be rejected, got %+v", out)
+		t.Fatalf("search with fast_scan_level 2 must be rejected, got %+v", out)
 	}
 	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{
 		LeftPath: a, RightPath: a,
