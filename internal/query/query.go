@@ -8,6 +8,8 @@
 package query
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -87,6 +89,37 @@ type Node struct {
 // compare naive datetimes with absolute timestamps.
 type TimeContext struct {
 	Timezone string `json:"timezone,omitempty"` // IANA name or offset like "+07:00"
+}
+
+// UnmarshalJSON decodes a node while preserving numeric literals
+// exactly: the value is decoded with UseNumber, so a predicate
+// value of 9007199254740993 stays that integer instead of
+// degrading to the float64 9007199254740992 before the evaluator
+// (whose exact-rational comparison could have handled it) ever
+// sees it. The same decode serves the checkpoint round-trip — a
+// scan stores its query as JSON and re-decodes it on resume, and
+// both legs must preserve the literal or a match can silently
+// become a no_match across a restart.
+func (n *Node) UnmarshalJSON(data []byte) error {
+	type alias Node
+	aux := &struct {
+		*alias
+		Value json.RawMessage `json:"value"`
+	}{alias: (*alias)(n)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	n.Value = nil
+	if len(aux.Value) > 0 && string(aux.Value) != "null" {
+		dec := json.NewDecoder(bytes.NewReader(aux.Value))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return fmt.Errorf("decoding predicate value: %w", err)
+		}
+		n.Value = v
+	}
+	return nil
 }
 
 const (

@@ -56,7 +56,7 @@ func (a *App) extractBinary(ctx context.Context, _ *mcp.CallToolRequest, in Extr
 	if i := strings.Index(in.Tag, ":"); i >= 0 {
 		name = in.Tag[i+1:]
 	}
-	if name == "All" || name == "*" {
+	if strings.EqualFold(name, "All") || name == "*" {
 		return fail("INVALID_ARGUMENT", "tag must name one specific tag")
 	}
 	op, err := runner.Operand(out.Path)
@@ -67,10 +67,14 @@ func (a *App) extractBinary(ctx context.Context, _ *mcp.CallToolRequest, in Extr
 	if err != nil {
 		return fail(errorCode(err), err.Error())
 	}
+	if res.ExitCode != 0 {
+		// A nonzero exit means the extraction failed; whatever
+		// partial bytes reached stdout are not the tag's data and
+		// must not be delivered as a complete extraction with a
+		// size and checksum.
+		return fail("EXTRACTION_FAILED", strings.TrimSpace(res.Stderr))
+	}
 	if len(res.Stdout) == 0 {
-		if res.ExitCode != 0 {
-			return fail("EXTRACTION_FAILED", strings.TrimSpace(res.Stderr))
-		}
 		return fail("BINARY_NOT_FOUND", "tag "+in.Tag+" has no extractable binary data in this file")
 	}
 	data := res.Stdout

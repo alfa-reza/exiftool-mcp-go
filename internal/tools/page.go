@@ -77,12 +77,20 @@ func (a *App) getResultPage(ctx context.Context, _ *mcp.CallToolRequest, in GetR
 		out.Errors = append(out.Errors, ToolError{Code: storeErrorCode(err), Message: err.Error()})
 		return errResult(), out, nil
 	}
+	// Argument-shape problems are INVALID_ARGUMENT, not store
+	// failures: routing them through storeErrorCode reported a
+	// malformed cursor as EXTRACTION_FAILED.
+	failArg := func(msg string) (*mcp.CallToolResult, GetResultPageOut, error) {
+		out.Status = "failed"
+		out.Errors = append(out.Errors, ToolError{Code: "INVALID_ARGUMENT", Message: msg})
+		return errResult(), out, nil
+	}
 	if in.ResultID == "" {
-		return fail(errors.New("result_id is required"))
+		return failArg("result_id is required")
 	}
 	offset, err := decodeCursor(in.Cursor)
 	if err != nil {
-		return fail(err)
+		return failArg(err.Error())
 	}
 	meta, err := a.Store.LoadMeta(in.ResultID)
 	if err != nil {

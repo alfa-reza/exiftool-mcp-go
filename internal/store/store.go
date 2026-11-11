@@ -617,17 +617,20 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 	if offset < 0 || offset > m.TotalBytes {
 		return nil, nil, 0, fmt.Errorf("%w: offset %d out of range", ErrCorrupt, offset)
 	}
+	// The payload is opened BEFORE the end-of-payload shortcut:
+	// a missing payload file is corruption the shortcut must not
+	// paper over with a successful empty read.
+	f, err := os.Open(filepath.Join(s.resultDir(id), file))
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	defer f.Close()
 	if offset == m.TotalBytes {
 		// A read at the exact end is a valid empty final fragment,
 		// not an error: the payload is exhausted by definition, so
 		// there is no next chunk.
 		return m, []byte{}, offset, nil
 	}
-	f, err := os.Open(filepath.Join(s.resultDir(id), file))
-	if err != nil {
-		return nil, nil, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
-	}
-	defer f.Close()
 	if _, err := f.Seek(offset, 0); err != nil {
 		return nil, nil, 0, err
 	}
@@ -722,6 +725,16 @@ func (s *Store) SaveScan(job *ScanJob) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The growth check and the write must be atomic across
+	// processes too: two servers sharing one store directory
+	// could otherwise each pass the check and overshoot the
+	// quota together (the result writers already hold this lock;
+	// checkpoints were the gap).
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	var existing int64
 	if fi, err := os.Stat(s.scanPath(job.ID)); err == nil {
 		existing = fi.Size()

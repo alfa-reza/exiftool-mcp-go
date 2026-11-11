@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,7 +20,7 @@ func BenchmarkEnumerate(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cands, errs := Enumerate([]string{root}, true, nil)
+		cands, errs, _ := Enumerate(context.Background(), []string{root}, true, nil)
 		if len(errs) != 0 || len(cands) != 2000 {
 			b.Fatalf("enumerate: %d candidates, %d errors", len(cands), len(errs))
 		}

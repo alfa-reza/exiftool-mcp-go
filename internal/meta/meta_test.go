@@ -246,7 +246,7 @@ func TestEnumeratePolicy(t *testing.T) {
 	// Non-regular file must be skipped without hanging.
 	makeFIFO(t, filepath.Join(root, "pipe.jpg"))
 
-	cands, errs := Enumerate([]string{root}, true, []string{"jpg"})
+	cands, errs, _ := Enumerate(context.Background(), []string{root}, true, []string{"jpg"})
 	if len(errs) != 0 {
 		t.Fatalf("unexpected enum errors: %+v", errs)
 	}
@@ -258,17 +258,17 @@ func TestEnumeratePolicy(t *testing.T) {
 		t.Fatalf("expected 4 candidates, got %v", paths)
 	}
 	// Non-recursive: only direct files.
-	cands2, _ := Enumerate([]string{root}, false, nil)
+	cands2, _, _ := Enumerate(context.Background(), []string{root}, false, nil)
 	if len(cands2) != 3 {
 		t.Fatalf("expected 3 shallow candidates, got %d", len(cands2))
 	}
 	// Missing path is a structured error, not a panic.
-	_, errs3 := Enumerate([]string{filepath.Join(root, "nope.jpg")}, false, nil)
+	_, errs3, _ := Enumerate(context.Background(), []string{filepath.Join(root, "nope.jpg")}, false, nil)
 	if len(errs3) != 1 || errs3[0].Code != "PATH_NOT_FOUND" {
 		t.Fatalf("expected PATH_NOT_FOUND, got %+v", errs3)
 	}
 	// Extension filter is case-insensitive and dot-optional.
-	cands4, _ := Enumerate([]string{root}, true, []string{".JPG"})
+	cands4, _, _ := Enumerate(context.Background(), []string{root}, true, []string{".JPG"})
 	if len(cands4) != 4 {
 		t.Fatalf("expected 4 with .JPG filter, got %d", len(cands4))
 	}
@@ -290,7 +290,7 @@ func TestEnumerateSymlinkRootRecursive(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Skipf("cannot create symlinks here: %v", err)
 	}
-	cands, errs := Enumerate([]string{link}, true, nil)
+	cands, errs, _ := Enumerate(context.Background(), []string{link}, true, nil)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -310,7 +310,7 @@ func TestEnumerateSymlinkFileRecursive(t *testing.T) {
 	if err := os.Symlink(real, filepath.Join(base, "link.jpg")); err != nil {
 		t.Skipf("cannot create symlinks here: %v", err)
 	}
-	cands, errs := Enumerate([]string{base}, true, nil)
+	cands, errs, _ := Enumerate(context.Background(), []string{base}, true, nil)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -337,7 +337,7 @@ func TestEnumerateTraversalErrorReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Chmod(sub, 0o755)
-	cands, errs := Enumerate([]string{base}, true, nil)
+	cands, errs, _ := Enumerate(context.Background(), []string{base}, true, nil)
 	if len(errs) == 0 {
 		t.Skip("directory permissions not enforced in this environment (likely running as root)")
 	}
@@ -405,4 +405,38 @@ func TestReaderStderrCorrelationWithDashPath(t *testing.T) {
 	if len(res) != 1 || res[0].Status != "error" || res[0].Error != "File format error" {
 		t.Fatalf("dash-path error not correlated: %+v", res)
 	}
+}
+
+func TestParseJSONArrayRejectsTrailingData(t *testing.T) {
+	// Output after the closing bracket is not part of the JSON
+	// document ExifTool produced; accepting it would bless
+	// malformed output as a successful read.
+	for _, data := range []string{
+		`[{"SourceFile":"x"}] trailing garbage`,
+		`[{"SourceFile":"x"}] {"more":1}`,
+		`[{"SourceFile":"x"}] ]`,
+	} {
+		if _, err := ParseJSONArray([]byte(data)); err == nil {
+			t.Fatalf("trailing data accepted: %q", data)
+		}
+	}
+	if _, err := ParseJSONArray([]byte("[{\"SourceFile\":\"x\"}]\n")); err != nil {
+		t.Fatalf("clean output with trailing newline rejected: %v", err)
+	}
+}
+
+func TestReadUnexplainedNonzeroExitFails(t *testing.T) {
+	// fakeRunner always exits 1. With valid JSON and no stderr
+	// diagnostics to correlate, nothing explains the failure, so
+	// the read must not report the file as a clean ok.
+	fr := &fakeRunner{
+		stdout: []byte(`[{"SourceFile":"/x/a.jpg","EXIF:IFD0:Make":"Canon"}]`),
+		stderr: "",
+	}
+	r := &Reader{Runner: fr}
+	if _, err := r.Read(context.Background(), []string{"/x/a.jpg"}, ReadSpec{}); err == nil {
+		t.Fatal("unexplained exit 1 was reported as a successful read")
+	}
+	// The explained counterpart keeps its per-file results:
+	// TestReadStderrErrorCorrelation covers a correlated error.
 }

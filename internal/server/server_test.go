@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,5 +137,64 @@ func TestStdioEndToEnd(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("File:FileType=JPEG entry not found in stdio read")
+	}
+}
+
+// TestStdioBigNumberPrecision proves the number-precision fix
+// end to end over the wire: the query literal 9007199254740993
+// must reach the evaluator intact (the SDK decodes tool
+// arguments with encoding/json, which honors the query node's
+// custom decoder), so it matches a file whose Comment is that
+// exact integer as text. With a plain float64 decode the value
+// degrades to 9007199254740992 and the match is lost.
+func TestStdioBigNumberPrecision(t *testing.T) {
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		t.Skip("exiftool not installed")
+	}
+	bin := buildServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	jpeg, err := base64.StdEncoding.DecodeString(tinyJPEG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(t.TempDir(), "big.jpg")
+	if err := os.WriteFile(fixture, jpeg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set := exec.Command("exiftool", "-overwrite_original", "-Comment=9007199254740993", fixture)
+	if out, err := set.CombinedOutput(); err != nil {
+		t.Fatalf("tag fixture: %v\n%s", err, out)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "e2e-test", Version: "0.0.1"}, nil)
+	cmd := exec.Command(bin)
+	cmd.Env = append(os.Environ(), "EXIFTOOL_MCP_STORE="+t.TempDir())
+	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer session.Close()
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "search_metadata",
+		Arguments: map[string]any{
+			"paths": []string{fixture},
+			"query": map[string]any{
+				"type": "predicate", "tag": "Comment", "operator": "eq",
+				"value": json.Number("9007199254740993"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("call search_metadata: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search_metadata returned error: %+v", res.Content)
+	}
+	sc, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("no structured content: %T", res.StructuredContent)
+	}
+	if sc["matched_count"] != float64(1) {
+		t.Fatalf("matched_count = %v, want 1 (the big literal lost precision in transit)", sc["matched_count"])
 	}
 }

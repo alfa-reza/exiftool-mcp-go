@@ -17,8 +17,10 @@ import (
 	"github.com/alfa-reza/exiftool-mcp-go/internal/tools"
 )
 
-// version is the server version reported to MCP clients.
-var version = "1.0.0"
+// version is the server version reported to MCP clients. The
+// seven read-only tools are still in development; v1.0.0 is
+// reserved for the later feature-complete release.
+var version = "0.1.0-dev"
 
 func main() {
 	log.SetOutput(os.Stderr)

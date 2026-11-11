@@ -554,3 +554,76 @@ func TestFragmentAtExactEOF(t *testing.T) {
 		t.Fatalf("Fragment at exact EOF: chunk = %q next = %d, want empty and 3", chunk, next)
 	}
 }
+
+func TestScanQuotaAcrossInstances(t *testing.T) {
+	// Checkpoints count toward the quota, and their growth check
+	// must be atomic across Store instances: before SaveScan took
+	// the inter-process write lock, two instances saving ~50 KB
+	// checkpoints concurrently overshot an 85 KB quota in most
+	// rounds (111 KB actual).
+	cands := make([]meta.Candidate, 600)
+	for i := range cands {
+		cands[i] = meta.Candidate{Path: fmt.Sprintf("/photos/dir/sub/img-%05d.jpg", i), Size: 1024, ModTime: time.Unix(1700000000, 0)}
+	}
+	for round := 0; round < 30; round++ {
+		dir := t.TempDir()
+		s1, err := New(dir, time.Hour, 85000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2, err := New(dir, time.Hour, 85000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = s1.CreateScan(&ScanJob{ResultID: strings.Repeat("a", 32), Candidates: cands})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = s2.CreateScan(&ScanJob{ResultID: strings.Repeat("b", 32), Candidates: cands})
+		}()
+		close(start)
+		wg.Wait()
+		if total := s1.TotalBytes(); total > 85000 {
+			t.Fatalf("round %d: total = %d, over the 85000 quota", round, total)
+		}
+	}
+}
+
+func TestFragmentMissingPayloadAtEOF(t *testing.T) {
+	// The end-of-payload shortcut must not hide a missing
+	// payload file: corruption is corruption at any offset.
+	st, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.SaveText("abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(st.Dir(), "results", m.ID, "text.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.Fragment(m.ID, 3, 10); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Fragment at EOF with deleted payload: err = %v, want ErrCorrupt", err)
+	}
+	// And the intact case still returns the empty final chunk.
+	st2, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := st2.SaveText("abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, chunk, next, err := st2.Fragment(m2.ID, 3, 10)
+	if err != nil || len(chunk) != 0 || next != 3 {
+		t.Fatalf("Fragment at EOF intact: chunk=%q next=%d err=%v", chunk, next, err)
+	}
+}

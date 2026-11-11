@@ -56,7 +56,7 @@ byte-exact binary extraction.
 ## Install
 
 ```sh
-go install github.com/alfa-reza/exiftool-mcp-go/cmd/exiftool-mcp-go@v1.0.0
+go install github.com/alfa-reza/exiftool-mcp-go/cmd/exiftool-mcp-go@v0.1.0-dev
 ```
 
 or from a checkout:

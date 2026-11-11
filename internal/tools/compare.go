@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"time"
@@ -26,16 +27,18 @@ type CompareMetadataIn struct {
 
 // ChangeRecord is one compared tag identity.
 type ChangeRecord struct {
-	Change     string `json:"change"` // added | removed | changed | unchanged
-	Key        string `json:"key"`
-	Group      string `json:"group,omitempty"`
-	Name       string `json:"name"`
-	Document   string `json:"document,omitempty"`
-	Instance   string `json:"instance,omitempty"`
-	Copy       string `json:"copy,omitempty"`
-	LeftValue  any    `json:"left_value,omitempty"`
-	RightValue any    `json:"right_value,omitempty"`
-	Ambiguous  bool   `json:"ambiguous,omitempty"`
+	Change        string         `json:"change"` // added | removed | changed | unchanged
+	Key           string         `json:"key"`
+	Group         string         `json:"group,omitempty"`
+	Name          string         `json:"name"`
+	Document      string         `json:"document,omitempty"`
+	Instance      string         `json:"instance,omitempty"`
+	Copy          string         `json:"copy,omitempty"`
+	LeftValue     any            `json:"left_value,omitempty"`
+	RightValue    any            `json:"right_value,omitempty"`
+	LeftValueRef  *meta.ValueRef `json:"left_value_ref,omitempty"`
+	RightValueRef *meta.ValueRef `json:"right_value_ref,omitempty"`
+	Ambiguous     bool           `json:"ambiguous,omitempty"`
 }
 
 type CompareMetadataOut struct {
@@ -233,9 +236,49 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 			}
 		}
 	}
+	// Externalize oversized side values before pagination: a
+	// single change record was previously returned whole, so one
+	// large value silently blew through max_response_bytes (a
+	// ~160 KB value against a 1024-byte budget). With the value
+	// in the result store as a fragment, the record itself is
+	// small and the budget binds again.
+	var madeRefs []string
+	for i := range returned {
+		for _, side := range []struct {
+			val *any
+			ref **meta.ValueRef
+		}{
+			{&returned[i].LeftValue, &returned[i].LeftValueRef},
+			{&returned[i].RightValue, &returned[i].RightValueRef},
+		} {
+			if *side.val == nil {
+				continue
+			}
+			e := meta.Entry{Value: *side.val}
+			if _, err := a.externalizeEntryValue(&e); err != nil {
+				return fail(storeErrorCode(err), err.Error())
+			}
+			if e.ValueRef != nil {
+				*side.val = nil
+				*side.ref = e.ValueRef
+				madeRefs = append(madeRefs, e.ValueRef.ResultID)
+			}
+		}
+	}
+	if err := a.verifyValueRefs(madeRefs); err != nil {
+		return fail(storeErrorCode(err), err.Error())
+	}
 	pageN, records, err := pageByBudget(returned, a.pageSize(in.ResponseOptions), a.maxBytes(in.ResponseOptions))
 	if err != nil {
 		return fail("EXTRACTION_FAILED", err.Error())
+	}
+	if pageN > 0 && len(records[0]) > a.maxBytes(in.ResponseOptions) {
+		// Still too large after externalization: paging cannot
+		// split a record, so fail explicitly instead of returning
+		// a response over the caller's budget.
+		return fail("INVALID_ARGUMENT", fmt.Sprintf(
+			"one change record is %d bytes, over max_response_bytes %d even after oversized values are externalized; raise max_response_bytes or narrow the comparison",
+			len(records[0]), a.maxBytes(in.ResponseOptions)))
 	}
 	page := returned[:pageN]
 	if pageN < len(returned) {
