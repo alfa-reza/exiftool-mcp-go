@@ -627,3 +627,95 @@ func TestFragmentMissingPayloadAtEOF(t *testing.T) {
 		t.Fatalf("Fragment at EOF intact: chunk=%q next=%d err=%v", chunk, next, err)
 	}
 }
+
+func TestSaveTextPendingSurvivesEviction(t *testing.T) {
+	// A pending (incomplete) fragment is not an eviction
+	// candidate: writes that would need its space fail instead
+	// of removing it. After MarkComplete it becomes an ordinary
+	// evictable result.
+	st, err := New(t.TempDir(), time.Hour, 45000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := st.SaveTextPending(strings.Repeat("a", 41000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Complete {
+		t.Fatal("pending fragment reported complete")
+	}
+	big := []json.RawMessage{json.RawMessage(`{"data":"` + strings.Repeat("x", 30000) + `"}`)}
+	if _, err := st.SaveRecords(big); !errors.Is(err, ErrFull) {
+		t.Fatalf("SaveRecords beside a pending fragment: err = %v, want ErrFull (no eviction)", err)
+	}
+	if _, err := st.LoadMeta(pending.ID); err != nil {
+		t.Fatalf("pending fragment vanished: %v", err)
+	}
+	if err := st.MarkComplete(pending.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveRecords(big); err != nil {
+		t.Fatalf("SaveRecords after finalize: %v", err)
+	}
+	if _, err := st.LoadMeta(pending.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("finalized fragment should have been evicted, err = %v", err)
+	}
+}
+
+func TestRecordsPageRecordTooLarge(t *testing.T) {
+	st, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := json.RawMessage(`{"data":"` + strings.Repeat("x", 3000) + `"}`)
+	m, err := st.SaveRecords([]json.RawMessage{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RecordsPage(m.ID, 0, 10, 64); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("oversized first record: err = %v, want ErrRecordTooLarge", err)
+	}
+	// A sufficient limit returns it whole.
+	_, page, err := st.RecordsPage(m.ID, 0, 10, 4096)
+	if err != nil || len(page.Records) != 1 {
+		t.Fatalf("sufficient limit: records=%d err=%v", len(page.Records), err)
+	}
+	// Mid-page budgets still end the page normally (no error).
+	small := []json.RawMessage{
+		json.RawMessage(`{"n":"` + strings.Repeat("a", 90) + `"}`),
+		json.RawMessage(`{"n":"` + strings.Repeat("b", 90) + `"}`),
+	}
+	m2, err := st.SaveRecords(small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, page, err = st.RecordsPage(m2.ID, 0, 10, 150)
+	if err != nil || len(page.Records) != 1 || !page.HasMore {
+		t.Fatalf("mid-page budget: records=%d hasMore=%v err=%v, want 1 record + HasMore", len(page.Records), page.HasMore, err)
+	}
+}
+
+func TestFragmentTruncatedPayload(t *testing.T) {
+	// A payload whose size disagrees with the metadata is
+	// corrupt at ANY offset, including the exact end: the EOF
+	// shortcut must not bless a truncated file with an empty
+	// success.
+	st, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.SaveBlob([]byte("abcdef"), "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := filepath.Join(st.Dir(), "results", m.ID, "blob.bin")
+	if err := os.Truncate(blob, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.Fragment(m.ID, 6, 10); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Fragment at EOF on truncated payload: err = %v, want ErrCorrupt", err)
+	}
+	if _, _, _, err := st.Fragment(m.ID, 0, 3); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Fragment mid-payload on truncated payload: err = %v, want ErrCorrupt", err)
+	}
+}

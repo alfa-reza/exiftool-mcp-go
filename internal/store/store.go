@@ -41,6 +41,9 @@ var (
 	ErrCorrupt  = errors.New("stored data corrupt")
 	ErrFull     = errors.New("result store quota exceeded")
 	ErrBusy     = errors.New("result store busy: write lock held by another process")
+	// ErrRecordTooLarge reports a stored record that cannot fit
+	// a page byte limit at all (RecordsPage).
+	ErrRecordTooLarge = errors.New("stored record exceeds the page byte limit")
 )
 
 // Kind classifies a stored result.
@@ -504,8 +507,27 @@ func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 	return m, nil
 }
 
-// SaveText stores a text payload.
+// SaveText stores a text payload as a complete result.
 func (s *Store) SaveText(text string) (*ResultMeta, error) {
+	return s.saveText(text, true)
+}
+
+// SaveTextPending stores a text payload as an INCOMPLETE result.
+// Cleanup never evicts incomplete results, so a fragment saved
+// this way cannot be removed by any write — including the commit
+// writes of the very call that created it — until its owner
+// finalizes it with MarkComplete once the records referencing it
+// are committed. Value fragments (value_ref targets) use this
+// lifecycle: a fragment that could be evicted between creation
+// and the commit of its referencing records can leave a
+// successful response carrying a dead reference. A pending
+// fragment abandoned by a failed call is still bounded by its
+// TTL: expiry removal does not consult completeness.
+func (s *Store) SaveTextPending(text string) (*ResultMeta, error) {
+	return s.saveText(text, false)
+}
+
+func (s *Store) saveText(text string, complete bool) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlock, err := s.lockWrite()
@@ -514,6 +536,7 @@ func (s *Store) SaveText(text string) (*ResultMeta, error) {
 	}
 	defer unlock()
 	m := s.newMeta(KindText)
+	m.Complete = complete
 	sum := sha256.Sum256([]byte(text))
 	m.SHA256 = hex.EncodeToString(sum[:])
 	m.TotalBytes = int64(len(text))
@@ -540,8 +563,10 @@ type Page struct {
 }
 
 // RecordsPage returns up to pageSize records starting at offset,
-// bounded by maxBytes of payload (a single oversized record is still
-// returned alone so no record is ever lost).
+// bounded by maxBytes of payload. A record that cannot fit the
+// byte limit at all fails with ErrRecordTooLarge: returning it
+// whole would break the budget, an empty page would wedge the
+// cursor on it forever, and truncating it would corrupt the JSON.
 func (s *Store) RecordsPage(id string, offset, pageSize int, maxBytes int) (*ResultMeta, *Page, error) {
 	m, err := s.LoadMeta(id)
 	if err != nil {
@@ -586,6 +611,10 @@ segments:
 			if pageSize > 0 && len(page.Records) >= pageSize {
 				break segments
 			}
+			if maxBytes > 0 && len(page.Records) == 0 && len(line) > maxBytes {
+				return nil, nil, fmt.Errorf("%w: record of %d bytes exceeds the %d-byte page limit; a limit of at least %d is required",
+					ErrRecordTooLarge, len(line), maxBytes, len(line))
+			}
 			if maxBytes > 0 && len(page.Records) > 0 && used+len(line) > maxBytes {
 				break segments
 			}
@@ -625,6 +654,17 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 		return nil, nil, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	if fi.Size() != m.TotalBytes {
+		// The payload on disk is not the payload the metadata
+		// describes (truncated or extended): corruption at any
+		// offset, including the end-of-payload shortcut below,
+		// which must not bless it with an empty success.
+		return nil, nil, 0, fmt.Errorf("%w: payload size %d does not match metadata total %d", ErrCorrupt, fi.Size(), m.TotalBytes)
+	}
 	if offset == m.TotalBytes {
 		// A read at the exact end is a valid empty final fragment,
 		// not an error: the payload is exhausted by definition, so

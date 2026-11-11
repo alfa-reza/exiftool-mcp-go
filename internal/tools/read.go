@@ -52,22 +52,33 @@ const largeValueThreshold = 32 << 10
 // externalizeEntryValue moves an oversized entry value into the
 // store as a text fragment and replaces it with a value_ref, so a
 // response never carries a huge value inline. It reports whether
-// the value was externalized.
-// verifyValueRefs returns a store-full error when any fragment
-// created during the current call no longer exists: quota
-// eviction during the call itself can remove an early fragment
-// when a later one is written, and a successful response must
-// never carry a reference that already reads back as not found.
-func (a *App) verifyValueRefs(ids []string) error {
+// the value was externalized. The fragment is created PENDING
+// (incomplete): cleanup never evicts incomplete results, so the
+// fragment survives every subsequent write of the owning call —
+// including the commit of the records that reference it — until
+// finalizeValueRefs completes it after that commit.
+// finalizeValueRefs verifies that every fragment created during
+// the current call still exists, then marks each one complete.
+// A successful response must never carry a reference that
+// already reads back as not found, so a missing fragment is a
+// store-full failure, not a response.
+func (a *App) finalizeValueRefs(ids []string) error {
+	unique := make([]string, 0, len(ids))
 	seen := make(map[string]bool)
 	for _, id := range ids {
 		if seen[id] {
 			continue
 		}
 		seen[id] = true
+		unique = append(unique, id)
 		if _, err := a.Store.LoadMeta(id); err != nil {
 			return fmt.Errorf("%w: a value reference created during this call no longer exists (%v); the result store quota is too small for the oversized values in one call",
 				store.ErrFull, err)
+		}
+	}
+	for _, id := range unique {
+		if err := a.Store.MarkComplete(id); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -82,7 +93,7 @@ func (a *App) externalizeEntryValue(e *meta.Entry) (bool, error) {
 	if s, ok := e.Value.(string); ok {
 		text = s
 	}
-	m, err := a.Store.SaveText(text)
+	m, err := a.Store.SaveTextPending(text)
 	if err != nil {
 		return false, err
 	}
@@ -221,7 +232,7 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 			}
 		}
 	}
-	if err := a.verifyValueRefs(madeRefs); err != nil {
+	if err := a.finalizeValueRefs(madeRefs); err != nil {
 		return failWith(storeErrorCode(err), err.Error())
 	}
 	out.ProcessedCount = processed

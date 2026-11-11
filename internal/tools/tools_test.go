@@ -547,8 +547,12 @@ func TestReadMetadataPagingAcrossChunks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, raw := range page.Items {
+		for _, item := range page.Items {
 			var fr meta.FileResult
+			raw, err := json.Marshal(item)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := json.Unmarshal(raw, &fr); err != nil {
 				t.Fatal(err)
 			}
@@ -927,7 +931,11 @@ func TestPagingDoesNotInvokeExifTool(t *testing.T) {
 			t.Fatalf("expected 1 record per page, got %d", len(page.Items))
 		}
 		var rec meta.FileResult
-		if err := json.Unmarshal(page.Items[0], &rec); err != nil {
+		raw, err := json.Marshal(page.Items[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &rec); err != nil {
 			t.Fatal(err)
 		}
 		if seen[filepath.Base(rec.Path)] {

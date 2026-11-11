@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -178,7 +180,11 @@ func encodeCursor(offset int) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("o:%d", offset)))
 }
 
-// decodeCursor parses a cursor produced by encodeCursor.
+// decodeCursor parses a cursor produced by encodeCursor. The
+// decoded form must be exactly "o:" followed by decimal digits:
+// a scanning parse (Sscanf) silently accepted trailing garbage
+// ("o:1junk", "o:1:2", "o:1.0" all decoded to offset 1), so the
+// shape is validated strictly before the number is parsed.
 func decodeCursor(s string) (int, error) {
 	if s == "" {
 		return 0, nil
@@ -187,8 +193,21 @@ func decodeCursor(s string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid cursor")
 	}
-	var off int
-	if _, err := fmt.Sscanf(string(raw), "o:%d", &off); err != nil || off < 0 {
+	str := string(raw)
+	if !strings.HasPrefix(str, "o:") {
+		return 0, fmt.Errorf("invalid cursor")
+	}
+	digits := str[len("o:"):]
+	if digits == "" {
+		return 0, fmt.Errorf("invalid cursor")
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("invalid cursor")
+		}
+	}
+	off, err := strconv.Atoi(digits)
+	if err != nil || off < 0 {
 		return 0, fmt.Errorf("invalid cursor")
 	}
 	return off, nil

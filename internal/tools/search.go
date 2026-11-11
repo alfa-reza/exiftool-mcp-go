@@ -103,6 +103,8 @@ type SearchMetadataOut struct {
 	ScanComplete       bool           `json:"scan_complete"`
 	ResumeToken        string         `json:"resume_token,omitempty"`
 	ResultID           string         `json:"result_id,omitempty"`
+	HasMore            bool           `json:"has_more,omitempty"`
+	NextCursor         string         `json:"next_cursor,omitempty"`
 	ExpiresAt          string         `json:"expires_at,omitempty"`
 	EffectiveOptions   map[string]any `json:"effective_options,omitempty"`
 	Errors             []ToolError    `json:"errors,omitempty"`
@@ -491,23 +493,6 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 			}
 		}
 	}
-	// Every fragment this batch created must still exist before
-	// its records are committed or returned: quota eviction
-	// during the batch itself can remove an early fragment when
-	// a later one is written, and neither a stored record nor a
-	// response may carry a reference that already reads back as
-	// not found.
-	var batchRefs []string
-	for _, rec := range callRecords {
-		for _, e := range rec.Values {
-			if e.ValueRef != nil {
-				batchRefs = append(batchRefs, e.ValueRef.ResultID)
-			}
-		}
-	}
-	if err := a.verifyValueRefs(batchRefs); err != nil {
-		return fail(storeErrorCode(err), err.Error())
-	}
 	// Commit order: records first, then the checkpoint that counts them.
 	if len(callRecords) > 0 {
 		records, err := marshalRecords(callRecords)
@@ -523,6 +508,23 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	if err := a.Store.SaveScan(job); err != nil {
 		return fail(storeErrorCode(err), err.Error())
 	}
+	// Finalize this batch's value fragments now that their
+	// records and the checkpoint are committed: the fragments
+	// were created pending (incomplete), which cleanup never
+	// evicts, so neither the externalization writes nor the
+	// commit above could remove them. They become ordinary
+	// results only here, after verification.
+	var batchRefs []string
+	for _, rec := range callRecords {
+		for _, e := range rec.Values {
+			if e.ValueRef != nil {
+				batchRefs = append(batchRefs, e.ValueRef.ResultID)
+			}
+		}
+	}
+	if err := a.finalizeValueRefs(batchRefs); err != nil {
+		return fail(storeErrorCode(err), err.Error())
+	}
 	if job.Done {
 		if err := a.Store.MarkComplete(job.ResultID); err != nil {
 			return fail(storeErrorCode(err), err.Error())
@@ -530,6 +532,16 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	}
 	pageN, _, err := pageByBudget(callRecords, a.Cfg.DefaultPageSize, a.Cfg.MaxResponseBytes)
 	if err == nil && pageN < len(callRecords) {
+		// The response carries only the first page of this
+		// batch's records; the rest are in the scan's stored
+		// result. Say so explicitly: scan completion and page
+		// truncation are different facts. The cursor addresses
+		// the result's global record list (records committed by
+		// earlier batches precede this batch's), and the agent
+		// continues with get_result_page — resume_token is not
+		// involved, it continues the scan, not the paging.
+		out.HasMore = true
+		out.NextCursor = encodeCursor(job.CommittedRecords - len(callRecords) + pageN)
 		callRecords = callRecords[:pageN]
 	}
 	out.Items = callRecords
