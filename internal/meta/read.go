@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/alfa-reza/exiftool-mcp-go/internal/runner"
@@ -98,7 +99,29 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 		out = append(out, FileResultFromPairs(f, obj))
 	}
 	applyStderrDiagnostics(out, files, res.Stderr)
+	if res.ExitCode != 0 && !explainedByDiagnostics(out) {
+		// ExifTool reported failure, but nothing in its output
+		// explains which file failed or why: the surviving
+		// entries cannot be trusted as complete reads (a
+		// "missing" verdict over them could be fabricated), so
+		// the read fails as a whole. Explained partial failures
+		// keep their per-file results above.
+		return nil, fmt.Errorf("exiftool exited %d without per-file diagnostics (stderr: %s)",
+			res.ExitCode, truncate(strings.TrimSpace(res.Stderr), 300))
+	}
 	return out, nil
+}
+
+// explainedByDiagnostics reports whether any file in the result
+// carries evidence of a failure: an error entry (including a
+// file ExifTool produced no output for) or a correlated warning.
+func explainedByDiagnostics(out []FileResult) bool {
+	for _, fr := range out {
+		if fr.Status == "error" || len(fr.Warnings) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // pathKey normalizes a path for correlation between requested files
@@ -236,6 +259,16 @@ func ParseJSONArray(data []byte) ([][]Pair, error) {
 	}
 	if d, ok := tok.(json.Delim); !ok || d != ']' {
 		return nil, fmt.Errorf("expected closing ']' in JSON array")
+	}
+	// Nothing may follow the array: trailing tokens mean the
+	// output was not the single JSON document ExifTool produced,
+	// and accepting them would bless malformed output as a
+	// successful read.
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("trailing data after JSON array")
+		}
+		return nil, fmt.Errorf("trailing data after JSON array: %w", err)
 	}
 	return objects, nil
 }

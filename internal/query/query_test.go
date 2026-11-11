@@ -424,3 +424,46 @@ func TestNullIsNotEmptyText(t *testing.T) {
 		t.Fatalf("Comment null exists = %v, want match", got)
 	}
 }
+
+func TestNodeDecodePreservesBigNumbers(t *testing.T) {
+	// A plain decode turns 9007199254740993 into the float64
+	// 9007199254740992 before the evaluator sees it; the literal
+	// must survive decoding, evaluation, and the checkpoint
+	// round-trip (marshal + re-decode, as resume does).
+	raw := []byte(`{"type":"predicate","tag":"Big","operator":"eq","value":9007199254740993}`)
+	var node Node
+	if err := json.Unmarshal(raw, &node); err != nil {
+		t.Fatal(err)
+	}
+	num, ok := node.Value.(json.Number)
+	if !ok || num.String() != "9007199254740993" {
+		t.Fatalf("decoded value = %T %v, want json.Number 9007199254740993", node.Value, node.Value)
+	}
+	es := []meta.Entry{meta.EntryFromPair("File:Big", json.Number("9007199254740993"))}
+	if got := eval(t, &node, nil, es); got != Match {
+		t.Fatalf("identical big literals = %v, want match", got)
+	}
+	raw2, err := json.Marshal(&node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var node2 Node
+	if err := json.Unmarshal(raw2, &node2); err != nil {
+		t.Fatal(err)
+	}
+	if got := eval(t, &node2, nil, es); got != Match {
+		t.Fatalf("after checkpoint round-trip = %v, want match", got)
+	}
+	// Nested numbers (in-operator lists) keep their precision too.
+	var node3 Node
+	if err := json.Unmarshal([]byte(`{"type":"predicate","tag":"Big","operator":"in","value":[9007199254740993,7]}`), &node3); err != nil {
+		t.Fatal(err)
+	}
+	list, ok := node3.Value.([]any)
+	if !ok || len(list) != 2 {
+		t.Fatalf("in-list decoded as %T, want []any of 2", node3.Value)
+	}
+	if n, ok := list[0].(json.Number); !ok || n.String() != "9007199254740993" {
+		t.Fatalf("in-list[0] = %T %v, want json.Number 9007199254740993", list[0], list[0])
+	}
+}

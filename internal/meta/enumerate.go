@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -29,7 +30,12 @@ type EnumError struct {
 // descended into (no loops), symlinked regular files are followed,
 // non-regular files (devices, FIFOs, sockets) are skipped, hidden files
 // are included, and the extension filter is case-insensitive.
-func Enumerate(paths []string, recursive bool, extensions []string) ([]Candidate, []EnumError) {
+//
+// Enumeration honors ctx: walking a huge tree must not run past
+// the caller's deadline or cancellation, so the walk checks the
+// context as it goes and returns its error (with the partial
+// results, which the caller discards) when it fires.
+func Enumerate(ctx context.Context, paths []string, recursive bool, extensions []string) ([]Candidate, []EnumError, error) {
 	extSet := make(map[string]bool, len(extensions))
 	for _, e := range extensions {
 		e = strings.ToLower(strings.TrimSpace(e))
@@ -61,6 +67,9 @@ func Enumerate(paths []string, recursive bool, extensions []string) ([]Candidate
 		out = append(out, Candidate{Path: abs, Size: info.Size(), ModTime: info.ModTime()})
 	}
 	for _, p := range paths {
+		if err := ctx.Err(); err != nil {
+			return out, errs, err
+		}
 		abs, err := filepath.Abs(p)
 		if err != nil {
 			errs = append(errs, EnumError{Path: p, Code: "PATH_NOT_FOUND", Message: err.Error()})
@@ -91,6 +100,9 @@ func Enumerate(paths []string, recursive bool, extensions []string) ([]Candidate
 				continue
 			}
 			for _, e := range entries {
+				if err := ctx.Err(); err != nil {
+					return out, errs, err
+				}
 				child := filepath.Join(abs, e.Name())
 				cfi, err := os.Stat(child)
 				if err != nil {
@@ -119,7 +131,10 @@ func Enumerate(paths []string, recursive bool, extensions []string) ([]Candidate
 				walkRoot = resolved
 			}
 		}
-		_ = filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
+		werr := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			if err != nil {
 				// A subtree that cannot be traversed is reported,
 				// not silently skipped: a scan that missed files
@@ -161,7 +176,10 @@ func Enumerate(paths []string, recursive bool, extensions []string) ([]Candidate
 			add(path, info)
 			return nil
 		})
+		if werr != nil {
+			return out, errs, werr
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out, errs
+	return out, errs, nil
 }

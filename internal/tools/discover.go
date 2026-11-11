@@ -98,7 +98,10 @@ func (a *App) discoverTags(ctx context.Context, _ *mcp.CallToolRequest, in Disco
 		if len(in.Paths) == 0 {
 			return fail("INVALID_ARGUMENT", "paths is required for scope=present_in_files")
 		}
-		candidates, enumErrs := meta.Enumerate(in.Paths, in.Recursive, in.Extensions)
+		candidates, enumErrs, err := meta.Enumerate(ctx, in.Paths, in.Recursive, in.Extensions)
+		if err != nil {
+			return fail(errorCode(err), err.Error())
+		}
 		for _, e := range enumErrs {
 			out.Errors = append(out.Errors, ToolError{Code: e.Code, Message: e.Message, Path: e.Path})
 		}

@@ -108,12 +108,29 @@ type SearchMetadataOut struct {
 	Errors             []ToolError    `json:"errors,omitempty"`
 }
 
-func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in SearchMetadataIn) (*mcp.CallToolResult, SearchMetadataOut, error) {
+func (a *App) searchMetadata(ctx context.Context, req *mcp.CallToolRequest, in SearchMetadataIn) (*mcp.CallToolResult, SearchMetadataOut, error) {
 	out := SearchMetadataOut{Status: "complete"}
 	fail := func(code, msg string) (*mcp.CallToolResult, SearchMetadataOut, error) {
 		out.Status = "failed"
 		out.Errors = append(out.Errors, ToolError{Code: code, Message: msg})
 		return errResult(), out, nil
+	}
+	// Recover the query from the RAW request arguments. The MCP
+	// SDK validates arguments by round-tripping them through a
+	// map[string]any (applySchema), which turns every JSON number
+	// into a float64 before the typed decode runs — a predicate
+	// value of 9007199254740993 arrives as 9007199254740992 no
+	// matter how the query type itself decodes. The request
+	// object still carries the client's exact bytes, so the
+	// query is re-decoded from them (query.Node preserves numeric
+	// literals); everything else keeps the SDK's typed decode.
+	if req != nil && req.Params != nil && len(req.Params.Arguments) > 0 {
+		var shim struct {
+			Query *query.Node `json:"query"`
+		}
+		if err := json.Unmarshal(req.Params.Arguments, &shim); err == nil && shim.Query != nil {
+			in.Query = shim.Query
+		}
 	}
 	if in.ResumeToken != "" {
 		if len(in.Paths) > 0 || in.Query != nil {
@@ -158,7 +175,19 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 	if err := guardFastLevel(spec); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
-	candidates, enumErrs := meta.Enumerate(in.Paths, in.Recursive, in.Extensions)
+	// Enumeration is part of the call's work: when the caller set
+	// max_seconds, the enumeration of a huge tree is bounded by
+	// it too, instead of running before the batch clock starts.
+	enumCtx := ctx
+	if in.ScanOptions != nil && in.ScanOptions.MaxSeconds > 0 {
+		var cancel context.CancelFunc
+		enumCtx, cancel = context.WithTimeout(ctx, time.Duration(min(in.ScanOptions.MaxSeconds, 3600))*time.Second)
+		defer cancel()
+	}
+	candidates, enumErrs, err := meta.Enumerate(enumCtx, in.Paths, in.Recursive, in.Extensions)
+	if err != nil {
+		return fail(errorCode(err), "enumerating candidates: "+err.Error())
+	}
 	result, err := a.Store.CreateResult(store.KindRecords)
 	if err != nil {
 		return fail(storeErrorCode(err), err.Error())
@@ -461,6 +490,23 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 				job.NoMatch++
 			}
 		}
+	}
+	// Every fragment this batch created must still exist before
+	// its records are committed or returned: quota eviction
+	// during the batch itself can remove an early fragment when
+	// a later one is written, and neither a stored record nor a
+	// response may carry a reference that already reads back as
+	// not found.
+	var batchRefs []string
+	for _, rec := range callRecords {
+		for _, e := range rec.Values {
+			if e.ValueRef != nil {
+				batchRefs = append(batchRefs, e.ValueRef.ResultID)
+			}
+		}
+	}
+	if err := a.verifyValueRefs(batchRefs); err != nil {
+		return fail(storeErrorCode(err), err.Error())
 	}
 	// Commit order: records first, then the checkpoint that counts them.
 	if len(callRecords) > 0 {

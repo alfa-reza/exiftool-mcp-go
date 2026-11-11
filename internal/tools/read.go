@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -52,6 +53,26 @@ const largeValueThreshold = 32 << 10
 // store as a text fragment and replaces it with a value_ref, so a
 // response never carries a huge value inline. It reports whether
 // the value was externalized.
+// verifyValueRefs returns a store-full error when any fragment
+// created during the current call no longer exists: quota
+// eviction during the call itself can remove an early fragment
+// when a later one is written, and a successful response must
+// never carry a reference that already reads back as not found.
+func (a *App) verifyValueRefs(ids []string) error {
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if _, err := a.Store.LoadMeta(id); err != nil {
+			return fmt.Errorf("%w: a value reference created during this call no longer exists (%v); the result store quota is too small for the oversized values in one call",
+				store.ErrFull, err)
+		}
+	}
+	return nil
+}
+
 func (a *App) externalizeEntryValue(e *meta.Entry) (bool, error) {
 	raw, err := json.Marshal(e.Value)
 	if err != nil || len(raw) <= largeValueThreshold {
@@ -95,7 +116,12 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 		out.Errors = append(out.Errors, ToolError{Code: "INVALID_ARGUMENT", Message: err.Error()})
 		return errResult(), out, nil
 	}
-	candidates, enumErrs := meta.Enumerate(in.Paths, in.Recursive, in.Extensions)
+	candidates, enumErrs, err := meta.Enumerate(ctx, in.Paths, in.Recursive, in.Extensions)
+	if err != nil {
+		out.Status = "failed"
+		out.Errors = append(out.Errors, ToolError{Code: errorCode(err), Message: err.Error()})
+		return errResult(), out, nil
+	}
 	for _, e := range enumErrs {
 		out.Errors = append(out.Errors, ToolError{Code: e.Code, Message: e.Message, Path: e.Path})
 	}
@@ -113,6 +139,7 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 	var pageRecords []json.RawMessage
 	pageBytes := 0
 	var stored *store.ResultMeta
+	var madeRefs []string
 	processed, errorCount := 0, 0
 	failWith := func(code, msg string) (*mcp.CallToolResult, ReadMetadataOut, error) {
 		out.Status = "failed"
@@ -133,6 +160,9 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 					// response would silently exceed its byte
 					// budget. Failing loudly beats a wrong reply.
 					return failWith(storeErrorCode(err), err.Error())
+				}
+				if ref := results[i].Entries[j].ValueRef; ref != nil {
+					madeRefs = append(madeRefs, ref.ResultID)
 				}
 			}
 		}
@@ -159,6 +189,16 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 			if len(pageItems) >= pageLimit {
 				break
 			}
+			if len(pageItems) == 0 && len(records[take]) > byteBudget {
+				// One file's record can never fit the byte budget,
+				// even after oversized values are externalized, and
+				// paging cannot split a record: fail explicitly
+				// instead of returning a response that silently
+				// exceeds the budget the caller set.
+				return failWith("INVALID_ARGUMENT", fmt.Sprintf(
+					"metadata for one file is %d bytes, over max_response_bytes %d even after oversized values are externalized; raise max_response_bytes or narrow the read",
+					len(records[take]), byteBudget))
+			}
 			if len(pageItems) > 0 && pageBytes+len(records[take]) > byteBudget {
 				break
 			}
@@ -180,6 +220,9 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 				return failWith(storeErrorCode(err), err.Error())
 			}
 		}
+	}
+	if err := a.verifyValueRefs(madeRefs); err != nil {
+		return failWith(storeErrorCode(err), err.Error())
 	}
 	out.ProcessedCount = processed
 	if processed == 0 || (errorCount == processed && processed > 0) {

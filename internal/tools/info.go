@@ -54,6 +54,10 @@ func (a *App) getExiftoolInfo(ctx context.Context, _ *mcp.CallToolRequest, in Ex
 	if in.Format != "" || in.IncludeFormats || in.IncludeGroups {
 		cat, err := a.catalog(ctx)
 		if err != nil {
+			// The status field must agree with the error: a
+			// failed catalog load is "unavailable", never "ok"
+			// alongside a tool error.
+			out.Status = "unavailable"
 			out.Errors = append(out.Errors, ToolError{Code: "EXTRACTION_FAILED", Message: err.Error()})
 			return errResult(), out, nil
 		}
