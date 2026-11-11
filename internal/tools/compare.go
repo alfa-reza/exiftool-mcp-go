@@ -265,9 +265,6 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 			}
 		}
 	}
-	if err := a.verifyValueRefs(madeRefs); err != nil {
-		return fail(storeErrorCode(err), err.Error())
-	}
 	pageN, records, err := pageByBudget(returned, a.pageSize(in.ResponseOptions), a.maxBytes(in.ResponseOptions))
 	if err != nil {
 		return fail("EXTRACTION_FAILED", err.Error())
@@ -291,6 +288,13 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 		out.HasMore = true
 		out.Complete = false
 		out.ExpiresAt = m.ExpiresAt.Format(time.RFC3339)
+	}
+	// Finalize the value fragments now that the records
+	// referencing them are committed: they were created pending
+	// (incomplete), which cleanup never evicts, so the
+	// SaveRecords above could not remove them.
+	if err := a.finalizeValueRefs(madeRefs); err != nil {
+		return fail(storeErrorCode(err), err.Error())
 	}
 	for _, c := range changes {
 		if c.Change == "unchanged" {

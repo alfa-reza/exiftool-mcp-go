@@ -1,10 +1,12 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -38,6 +40,11 @@ func storeErrorCode(err error) string {
 		return "CHECKPOINT_CORRUPT"
 	case errors.Is(err, store.ErrFull):
 		return "RESULT_STORE_FULL"
+	case errors.Is(err, store.ErrRecordTooLarge):
+		// The caller's byte limit cannot hold the record; the
+		// remedy is a larger limit, which makes this an
+		// argument problem, not a store failure.
+		return "INVALID_ARGUMENT"
 	default:
 		return "EXTRACTION_FAILED"
 	}
@@ -53,21 +60,27 @@ type GetResultPageIn struct {
 }
 
 type GetResultPageOut struct {
-	Status       string            `json:"status"` // complete | failed
-	Kind         string            `json:"kind,omitempty"`
-	Items        []json.RawMessage `json:"items,omitempty"`
-	Text         string            `json:"text,omitempty"`
-	Data         string            `json:"data,omitempty"` // base64 for binary fragments
-	Offset       int64             `json:"offset,omitempty"`
-	TotalRecords int               `json:"total_records,omitempty"`
-	TotalBytes   int64             `json:"total_bytes,omitempty"`
-	MIME         string            `json:"mime,omitempty"`
-	SHA256       string            `json:"sha256,omitempty"`
-	NextCursor   string            `json:"next_cursor,omitempty"`
-	HasMore      bool              `json:"has_more"`
-	Complete     bool              `json:"complete"`
-	ExpiresAt    string            `json:"expires_at,omitempty"`
-	Errors       []ToolError       `json:"errors,omitempty"`
+	Status string `json:"status"` // complete | failed
+	Kind   string `json:"kind,omitempty"`
+	// Items holds the page's records as decoded JSON values.
+	// []json.RawMessage cannot be used here: the SDK infers the
+	// output schema from the Go type, RawMessage reflects as an
+	// array of bytes, and every records response then fails
+	// output validation over the real transport (an array of
+	// objects where an array of arrays was advertised).
+	Items        []any       `json:"items,omitempty"`
+	Text         string      `json:"text,omitempty"`
+	Data         string      `json:"data,omitempty"` // base64 for binary fragments
+	Offset       int64       `json:"offset,omitempty"`
+	TotalRecords int         `json:"total_records,omitempty"`
+	TotalBytes   int64       `json:"total_bytes,omitempty"`
+	MIME         string      `json:"mime,omitempty"`
+	SHA256       string      `json:"sha256,omitempty"`
+	NextCursor   string      `json:"next_cursor,omitempty"`
+	HasMore      bool        `json:"has_more"`
+	Complete     bool        `json:"complete"`
+	ExpiresAt    string      `json:"expires_at,omitempty"`
+	Errors       []ToolError `json:"errors,omitempty"`
 }
 
 func (a *App) getResultPage(ctx context.Context, _ *mcp.CallToolRequest, in GetResultPageIn) (*mcp.CallToolResult, GetResultPageOut, error) {
@@ -123,7 +136,20 @@ func (a *App) getResultPage(ctx context.Context, _ *mcp.CallToolRequest, in GetR
 		if err != nil {
 			return fail(err)
 		}
-		out.Items = page.Records
+		// Records are stored as raw JSON lines; decode them into
+		// values for the response (UseNumber, so a big integer in
+		// a stored record re-marshals as the same literal).
+		items := make([]any, len(page.Records))
+		for i, raw := range page.Records {
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.UseNumber()
+			var v any
+			if err := dec.Decode(&v); err != nil {
+				return fail(fmt.Errorf("%w: stored record is not valid JSON: %v", store.ErrCorrupt, err))
+			}
+			items[i] = v
+		}
+		out.Items = items
 		out.Offset = int64(offset)
 		out.HasMore = page.HasMore
 		if page.HasMore {
