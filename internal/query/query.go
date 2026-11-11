@@ -354,6 +354,14 @@ func (p *Prepared) evalSameDocument(n *pnode, entries []meta.Entry) (Tri, string
 	}
 	inner := *n
 	inner.scope = "file"
+	if len(entries) == 0 {
+		// A successful read that produced no tags still has one
+		// implicit document scope — the file itself — so evaluate
+		// the group against the empty set, exactly as file scope
+		// does, instead of falling through to a blanket no_match:
+		// "Make missing" over a tagless file is a match.
+		return p.evalNode(&inner, nil)
+	}
 	sawIndet := false
 	var reason string
 	for _, k := range order {

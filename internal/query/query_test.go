@@ -369,3 +369,58 @@ func TestDateLikeIdentifiersCompareAsText(t *testing.T) {
 		t.Fatalf("SerialNumber eq with value_type=datetime = %v, want match", got)
 	}
 }
+
+func TestSameDocumentEmptyEntries(t *testing.T) {
+	// A read that produced no tags still has the file itself as
+	// its one implicit document: "Make missing" matches, exactly
+	// as in file scope, instead of a blanket no_match.
+	n := &Node{Type: "all", Scope: "same_document", Children: []*Node{
+		{Type: "predicate", Tag: "Make", Operator: "missing"},
+	}}
+	if got := eval(t, n, nil, nil); got != Match {
+		t.Fatalf("same_document Make missing over zero entries = %v, want match", got)
+	}
+	n2 := &Node{Type: "all", Scope: "same_document", Children: []*Node{
+		{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"},
+	}}
+	if got := eval(t, n2, nil, nil); got != NoMatch {
+		t.Fatalf("same_document Make eq Canon over zero entries = %v, want no_match", got)
+	}
+}
+
+func TestNonFiniteNumbersAreIndeterminate(t *testing.T) {
+	// ParseFloat accepts "NaN"/"Inf", but NaN is unordered: in
+	// float fallback comparison it read as "equal" to every
+	// number, in both directions. Non-finite operands are not
+	// numbers; verdicts over them are indeterminate.
+	num := func(tag, op string, v any) *Node {
+		p := pred(tag, op, v)
+		p.ValueType = "number"
+		return p
+	}
+	if got := eval(t, num("ISO", "eq", 20), nil, entries("EXIF:ISO", "NaN")); got != Indeterminate {
+		t.Fatalf("ISO \"NaN\" eq 20 = %v, want indeterminate", got)
+	}
+	if got := eval(t, num("ISO", "eq", "NaN"), nil, entries("EXIF:ISO", 100)); got != Indeterminate {
+		t.Fatalf("ISO 100 eq \"NaN\" = %v, want indeterminate", got)
+	}
+	if got := eval(t, num("ISO", "gt", 1000000), nil, entries("EXIF:ISO", "Inf")); got != Indeterminate {
+		t.Fatalf("ISO \"Inf\" gt 1000000 = %v, want indeterminate", got)
+	}
+	if got := eval(t, num("ISO", "eq", 20), nil, entries("EXIF:ISO", "20")); got != Match {
+		t.Fatalf("ISO \"20\" eq 20 = %v, want match (finite control)", got)
+	}
+}
+
+func TestNullIsNotEmptyText(t *testing.T) {
+	// A null value means the tag is present without a value; it
+	// is not the empty string, so value comparisons are
+	// indeterminate while presence still counts.
+	es := entries("File:Comment", nil)
+	if got := eval(t, pred("Comment", "eq", ""), nil, es); got != Indeterminate {
+		t.Fatalf("Comment null eq \"\" = %v, want indeterminate", got)
+	}
+	if got := eval(t, pred("Comment", "exists", nil), nil, es); got != Match {
+		t.Fatalf("Comment null exists = %v, want match", got)
+	}
+}

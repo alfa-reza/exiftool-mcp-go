@@ -145,6 +145,11 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 		return fail("INVALID_ARGUMENT", ferr.Error())
 	}
 	spec := in.ReadOptions.Spec(include, exclude)
+	// Diffs pair duplicate copies by value; without family 4,
+	// ExifTool's JSON silently drops same-group duplicates and
+	// the diff would compare a subset of the values. Compare
+	// therefore always reads duplicates, like search.
+	spec.IncludeDuplicates = true
 	if err := spec.Validate(); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}

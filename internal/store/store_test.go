@@ -494,3 +494,63 @@ func TestQuotaCountsMetadata(t *testing.T) {
 		t.Fatalf("TotalBytes after small write = %d, over the 4096 quota", got)
 	}
 }
+
+func TestQuotaAcrossInstances(t *testing.T) {
+	// Two Store instances on one directory (two MCP servers
+	// sharing EXIFTOOL_MCP_STORE): the capacity check and the
+	// write must be atomic across processes too, not only under
+	// one instance's mutex. Before the inter-process write lock,
+	// concurrent writers overshot a 1300-byte quota to ~2388.
+	for round := 0; round < 3; round++ {
+		dir := t.TempDir()
+		s1, err := New(dir, time.Hour, 1300)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2, err := New(dir, time.Hour, 1300)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := strings.Repeat("x", 900)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _, _ = s1.SaveText(payload) }()
+		go func() { defer wg.Done(); _, _ = s2.SaveText(payload) }()
+		wg.Wait()
+		if total := s1.TotalBytes(); total > 1300 {
+			t.Fatalf("round %d: total = %d, over the 1300 quota", round, total)
+		}
+	}
+}
+
+func TestSaveRecordsNilCountsMeta(t *testing.T) {
+	// An empty record set still writes a meta.json; the quota
+	// must cover it.
+	st, err := New(t.TempDir(), time.Hour, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveRecords(nil); !errors.Is(err, ErrFull) {
+		t.Fatalf("SaveRecords(nil) at quota 1: err = %v, want ErrFull", err)
+	}
+}
+
+func TestFragmentAtExactEOF(t *testing.T) {
+	// Offset == payload length is a valid empty final fragment:
+	// no bytes, cursor unchanged, no error.
+	st, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.SaveText("abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, chunk, next, err := st.Fragment(m.ID, 3, 10)
+	if err != nil {
+		t.Fatalf("Fragment at exact EOF: err = %v, want nil", err)
+	}
+	if len(chunk) != 0 || next != 3 {
+		t.Fatalf("Fragment at exact EOF: chunk = %q next = %d, want empty and 3", chunk, next)
+	}
+}
