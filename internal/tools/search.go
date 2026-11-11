@@ -143,6 +143,15 @@ func (a *App) searchMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Sea
 		// entries; request family 3 without forcing -ee.
 		spec.DocProvenance = true
 	}
+	// Verdicts are computed over EVERY value of a tag: without
+	// family 4, ExifTool's JSON silently drops same-group
+	// duplicates, and a hidden value could flip a verdict — a
+	// fabricated no_match under duplicate_match "any". Search
+	// therefore always reads duplicates; the caller's
+	// include_duplicates choice governs read_metadata output,
+	// not verdict inputs. EffectiveOptions reports the spec
+	// actually used.
+	spec.IncludeDuplicates = true
 	if err := spec.Validate(); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
@@ -316,6 +325,12 @@ func (a *App) externalizeValues(entries []meta.Entry) ([]meta.Entry, error) {
 
 // runSearchBatch evaluates one bounded batch of the scan and commits it.
 func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *store.ScanJob, prepared *query.Prepared, spec meta.ReadSpec, out SearchMetadataOut) (*mcp.CallToolResult, SearchMetadataOut, error) {
+	// The checkpoint exists before the batch runs, so every
+	// outcome of this call — including a failed first batch —
+	// identifies it: the caller can resume instead of restarting
+	// the scan from zero.
+	out.ResultID = job.ResultID
+	out.ResumeToken = job.ID
 	fail := func(code, msg string) (*mcp.CallToolResult, SearchMetadataOut, error) {
 		out.Status = "failed"
 		out.Errors = append(out.Errors, ToolError{Code: code, Message: msg})

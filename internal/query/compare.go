@@ -2,6 +2,7 @@ package query
 
 import (
 	"encoding/json"
+	"math"
 	"math/big"
 	"regexp"
 	"strconv"
@@ -417,14 +418,30 @@ func ratFromDecimal(s string) (*big.Rat, bool) {
 	return r, ok
 }
 
+// isFinite reports whether f is a usable numeric operand.
+// ParseFloat accepts "NaN" and "Inf", but NaN is unordered —
+// neither less than nor greater than anything — so admitting it
+// made cmpNumeric report every number as "equal" to NaN.
+// Non-finite values are not numbers for comparison purposes;
+// predicates over them are indeterminate.
+func isFinite(f float64) bool {
+	return !math.IsNaN(f) && !math.IsInf(f, 0)
+}
+
 // toNumber converts a JSON-ish value to float64 without guessing:
 // numeric strings must parse in full; strings with units do not convert.
 func toNumber(v any) (float64, bool) {
 	switch x := v.(type) {
 	case json.Number:
 		f, err := x.Float64()
-		return f, err == nil
+		if err != nil || !isFinite(f) {
+			return 0, false
+		}
+		return f, true
 	case float64:
+		if !isFinite(x) {
+			return 0, false
+		}
 		return x, true
 	case int:
 		return float64(x), true
@@ -436,7 +453,7 @@ func toNumber(v any) (float64, bool) {
 			return 0, false
 		}
 		f, err := strconv.ParseFloat(s, 64)
-		if err != nil {
+		if err != nil || !isFinite(f) {
 			return 0, false
 		}
 		return f, true
@@ -445,6 +462,9 @@ func toNumber(v any) (float64, bool) {
 }
 
 // toText renders a scalar as text for text operators and equality.
+// A JSON null is NOT the empty string: the tag is present but
+// carries no value, so it is not text and comparisons over it are
+// indeterminate (presence itself is exists/missing territory).
 func toText(v any) (string, bool) {
 	switch x := v.(type) {
 	case string:
@@ -458,8 +478,6 @@ func toText(v any) (string, bool) {
 			return "true", true
 		}
 		return "false", true
-	case nil:
-		return "", true
 	}
 	return "", false
 }

@@ -1480,3 +1480,92 @@ func TestSearchSameDocumentGetsProvenance(t *testing.T) {
 		t.Fatalf("same_document over plain files should match a.jpg determinately: %+v", out)
 	}
 }
+
+func comSegment(s string) []byte {
+	seg := []byte{0xFF, 0xFE, 0, byte(len(s) + 2)}
+	return append(seg, s...)
+}
+
+func TestSearchFindsHiddenDuplicateValue(t *testing.T) {
+	// A JPEG with two COM segments carries two File:Comment
+	// values in the same group. Without family 4, ExifTool's
+	// JSON silently drops the second one, and a search for it
+	// returned a fabricated no_match even though
+	// duplicate_match "any" promises every value is evaluated.
+	// Search (and compare) therefore force duplicates on.
+	requireExifTool(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dup.jpg")
+	writeJPEG(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := append([]byte{}, data[:2]...)
+	out = append(out, comSegment("draft")...)
+	out = append(out, comSegment("approved")...)
+	out = append(out, data[2:]...)
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := newTestApp(t, t.TempDir())
+	ctx := context.Background()
+	q := &query.Node{Type: "predicate", Tag: "Comment", Operator: "eq", Value: "approved"}
+	_, sout, err := app.searchMetadata(ctx, nil, SearchMetadataIn{Paths: []string{path}, Query: q})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sout.MatchedCount != 1 {
+		t.Fatalf("search for the second duplicate value: matched = %d, want 1 (%+v)", sout.MatchedCount, sout)
+	}
+	_, cout, err := app.compareMetadata(ctx, nil, CompareMetadataIn{LeftPath: path, RightPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cout.EffectiveOptions["include_duplicates"] != true {
+		t.Fatalf("compare must disclose forced duplicates, got %v", cout.EffectiveOptions["include_duplicates"])
+	}
+}
+
+type failRunner struct{}
+
+func (failRunner) Run(_ context.Context, _ ...string) (runner.Result, error) {
+	return runner.Result{}, context.DeadlineExceeded
+}
+func (failRunner) Path() string       { return "fake" }
+func (failRunner) ConfigMode() string { return "standard" }
+
+func TestSearchFirstBatchFailureCarriesResumeToken(t *testing.T) {
+	// The checkpoint is created before the first batch runs; a
+	// transient failure must still identify it, or the caller
+	// cannot resume and has to restart the scan.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.jpg"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		StoreDir: t.TempDir(), CallTimeout: 5 * time.Second, MaxConcurrency: 2,
+		MaxResponseBytes: 1 << 20, DefaultPageSize: 100, MaxInlineBinary: 1 << 20,
+		ResultTTL: time.Hour, StoreQuotaBytes: 1 << 30, ScanBatchFiles: 200, ScanBatchTime: 30 * time.Second,
+	}
+	fr := failRunner{}
+	st, err := store.New(cfg.StoreDir, cfg.ResultTTL, cfg.StoreQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{Cfg: cfg, Runner: fr, Reader: &meta.Reader{Runner: fr}, Store: st}
+	q := &query.Node{Type: "predicate", Tag: "Make", Operator: "eq", Value: "Canon"}
+	_, out, err := app.searchMetadata(context.Background(), nil, SearchMetadataIn{Paths: []string{dir}, Query: q})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "failed" {
+		t.Fatalf("status = %s, want failed", out.Status)
+	}
+	if out.ResultID == "" || out.ResumeToken == "" {
+		t.Fatalf("failed first batch must carry result_id and resume_token, got %+v", out)
+	}
+	if _, err := st.LoadScan(out.ResumeToken); err != nil {
+		t.Fatalf("resume token does not identify a saved checkpoint: %v", err)
+	}
+}

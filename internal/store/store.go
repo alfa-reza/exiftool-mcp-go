@@ -40,6 +40,7 @@ var (
 	ErrExpired  = errors.New("result expired")
 	ErrCorrupt  = errors.New("stored data corrupt")
 	ErrFull     = errors.New("result store quota exceeded")
+	ErrBusy     = errors.New("result store busy: write lock held by another process")
 )
 
 // Kind classifies a stored result.
@@ -264,17 +265,23 @@ func recordsBytes(records []json.RawMessage) int64 {
 func (s *Store) SaveRecords(records []json.RawMessage) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	m := s.newMeta(KindRecords)
-	add := recordsBytes(records)
+	// appendSegment will reference exactly one segment when there
+	// are records; measure the meta in the state saveMeta will
+	// persist — including for an empty result, whose meta.json is
+	// still store data the quota must cover.
+	sim := *m
 	if len(records) > 0 {
-		// appendSegment will reference exactly one segment; measure
-		// the meta in the state saveMeta will persist.
-		sim := *m
 		sim.Segments = []Segment{{File: "seg-000001.jsonl", Records: len(records), Bytes: recordsBytes(records)}}
 		sim.TotalRecords = len(records)
 		sim.TotalBytes = recordsBytes(records)
-		add += metaBytes(&sim)
 	}
+	add := recordsBytes(records) + metaBytes(&sim)
 	if err := s.ensureCapacity(add); err != nil {
 		return nil, err
 	}
@@ -295,6 +302,11 @@ func (s *Store) SaveRecords(records []json.RawMessage) (*ResultMeta, error) {
 func (s *Store) CreateResult(kind Kind) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	m := s.newMeta(kind)
 	m.Complete = false
 	// Even an empty result occupies its meta.json; the quota
@@ -339,6 +351,11 @@ func (s *Store) appendSegment(m *ResultMeta, records []json.RawMessage) (string,
 func (s *Store) AppendRecords(id string, records []json.RawMessage) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	m, err := s.LoadMeta(id)
 	if err != nil {
 		return nil, err
@@ -377,6 +394,11 @@ func (s *Store) AppendRecords(id string, records []json.RawMessage) (*ResultMeta
 func (s *Store) TruncateRecords(id string, keep int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	m, err := s.LoadMeta(id)
 	if err != nil {
 		return err
@@ -440,6 +462,11 @@ func (s *Store) TruncateRecords(id string, keep int) error {
 func (s *Store) MarkComplete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	m, err := s.LoadMeta(id)
 	if err != nil {
 		return err
@@ -452,6 +479,11 @@ func (s *Store) MarkComplete(id string) error {
 func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	m := s.newMeta(KindBinary)
 	sum := sha256.Sum256(data)
 	m.SHA256 = hex.EncodeToString(sum[:])
@@ -476,6 +508,11 @@ func (s *Store) SaveBlob(data []byte, mime string) (*ResultMeta, error) {
 func (s *Store) SaveText(text string) (*ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	m := s.newMeta(KindText)
 	sum := sha256.Sum256([]byte(text))
 	m.SHA256 = hex.EncodeToString(sum[:])
@@ -579,6 +616,12 @@ func (s *Store) Fragment(id string, offset int64, maxBytes int) (*ResultMeta, []
 	}
 	if offset < 0 || offset > m.TotalBytes {
 		return nil, nil, 0, fmt.Errorf("%w: offset %d out of range", ErrCorrupt, offset)
+	}
+	if offset == m.TotalBytes {
+		// A read at the exact end is a valid empty final fragment,
+		// not an error: the payload is exhausted by definition, so
+		// there is no next chunk.
+		return m, []byte{}, offset, nil
 	}
 	f, err := os.Open(filepath.Join(s.resultDir(id), file))
 	if err != nil {
@@ -743,6 +786,69 @@ func readLockToken(path string) string {
 // token before touching the file: after a takeover the file belongs
 // to the successor, and the stale owner must neither refresh nor
 // delete it. Waiting honors ctx cancellation.
+// writeLockWait bounds how long a writer waits for a peer process
+// to finish its write before reporting the store busy. Writes are
+// short (a payload plus its meta), so this is generous.
+const writeLockWait = 30 * time.Second
+
+// lockWrite acquires the store-wide inter-process write lock. The
+// in-process mutex makes a capacity check and the write it guards
+// atomic within one server, but several MCP servers can share one
+// store directory; this lock extends the same atomicity across
+// processes, following the scan-lock discipline (exclusive
+// create, ownership token, heartbeat, stale takeover). The caller
+// must already hold s.mu and must call the returned release
+// function when the write is done.
+func (s *Store) lockWrite() (func(), error) {
+	path := filepath.Join(s.dir, "write.lock")
+	token := fmt.Sprintf("%d-%s", os.Getpid(), newID())
+	deadline := time.Now().Add(writeLockWait)
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = f.WriteString(token)
+			_ = f.Close()
+			stop := make(chan struct{})
+			go func() {
+				tick := time.NewTicker(lockHeartbeat)
+				defer tick.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+						if readLockToken(path) != token {
+							return // taken over; stop refreshing
+						}
+						now := time.Now()
+						_ = os.Chtimes(path, now, now)
+					}
+				}
+			}()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					close(stop)
+					if readLockToken(path) == token {
+						_ = os.Remove(path)
+					}
+				})
+			}, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if fi, err := os.Stat(path); err == nil && time.Since(fi.ModTime()) > lockStaleAfter {
+			_ = os.Remove(path)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, ErrBusy
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
 	if !validID(id) {
 		return nil, ErrNotFound
@@ -806,6 +912,11 @@ func (s *Store) LockScan(ctx context.Context, id string) (func(), error) {
 func (s *Store) Cleanup() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	return s.cleanup(0)
 }
 
