@@ -256,6 +256,7 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 			}
 			e := meta.Entry{Value: *side.val}
 			if _, err := a.externalizeEntryValue(&e); err != nil {
+				a.discardRefs(madeRefs)
 				return fail(storeErrorCode(err), err.Error())
 			}
 			if e.ValueRef != nil {
@@ -267,12 +268,14 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 	}
 	pageN, records, err := pageByBudget(returned, a.pageSize(in.ResponseOptions), a.maxBytes(in.ResponseOptions))
 	if err != nil {
+		a.discardRefs(madeRefs)
 		return fail("EXTRACTION_FAILED", err.Error())
 	}
 	if pageN > 0 && len(records[0]) > a.maxBytes(in.ResponseOptions) {
 		// Still too large after externalization: paging cannot
 		// split a record, so fail explicitly instead of returning
 		// a response over the caller's budget.
+		a.discardRefs(madeRefs)
 		return fail("INVALID_ARGUMENT", fmt.Sprintf(
 			"one change record is %d bytes, over max_response_bytes %d even after oversized values are externalized; raise max_response_bytes or narrow the comparison",
 			len(records[0]), a.maxBytes(in.ResponseOptions)))
@@ -281,6 +284,7 @@ func (a *App) compareMetadata(ctx context.Context, _ *mcp.CallToolRequest, in Co
 	if pageN < len(returned) {
 		m, err := a.Store.SaveRecords(records)
 		if err != nil {
+			a.discardRefs(madeRefs)
 			return fail(storeErrorCode(err), err.Error())
 		}
 		out.ResultID = m.ID

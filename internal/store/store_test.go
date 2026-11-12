@@ -719,3 +719,159 @@ func TestFragmentTruncatedPayload(t *testing.T) {
 		t.Fatalf("Fragment mid-payload on truncated payload: err = %v, want ErrCorrupt", err)
 	}
 }
+
+func TestDiscardResult(t *testing.T) {
+	st, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.SaveTextPending("payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DiscardResult(m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LoadMeta(m.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after discard: err = %v, want ErrNotFound", err)
+	}
+	// Discarding an absent result is not an error.
+	if err := st.DiscardResult(m.ID); err != nil {
+		t.Fatalf("second discard: %v", err)
+	}
+}
+
+func TestReferencedFragmentIsPinned(t *testing.T) {
+	// An unreferenced fragment is evicted under quota pressure;
+	// a fragment referenced by a surviving records result is
+	// not — a value_ref stays valid as long as its referer.
+	st, err := New(t.TempDir(), time.Hour, 90000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unref, err := st.SaveText(strings.Repeat("u", 41000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frag, err := st.SaveTextPending(strings.Repeat("a", 41000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkComplete(frag.ID); err != nil {
+		t.Fatal(err)
+	}
+	refRecord := json.RawMessage(`{"values":[{"value_ref":{"result_id":"` + frag.ID + `","kind":"text"}}]}`)
+	if _, err := st.SaveRecords([]json.RawMessage{refRecord}); err != nil {
+		t.Fatal(err)
+	}
+	big := []json.RawMessage{json.RawMessage(`{"data":"` + strings.Repeat("x", 30000) + `"}`)}
+	if _, err := st.SaveRecords(big); err != nil {
+		t.Fatalf("pressure write: %v", err)
+	}
+	if _, err := st.LoadMeta(unref.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unreferenced fragment: err = %v, want evicted (ErrNotFound)", err)
+	}
+	if _, err := st.LoadMeta(frag.ID); err != nil {
+		t.Fatalf("referenced fragment was evicted while its referer survives: %v", err)
+	}
+}
+
+func TestPinnedFragmentBlocksWriteUntilRefererDies(t *testing.T) {
+	// When the only eviction candidate is pinned, the write
+	// fails with ErrFull rather than breaking the reference.
+	// Once the referer is gone, the fragment is evictable.
+	st, err := New(t.TempDir(), time.Hour, 50000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frag, err := st.SaveTextPending(strings.Repeat("a", 41000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkComplete(frag.ID); err != nil {
+		t.Fatal(err)
+	}
+	refRecord := json.RawMessage(`{"values":[{"value_ref":{"result_id":"` + frag.ID + `","kind":"text"}}]}`)
+	referer, err := st.SaveRecords([]json.RawMessage{refRecord})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveText(strings.Repeat("b", 20000)); !errors.Is(err, ErrFull) {
+		t.Fatalf("write beside a pinned fragment: err = %v, want ErrFull", err)
+	}
+	if _, err := st.LoadMeta(frag.ID); err != nil {
+		t.Fatalf("pinned fragment vanished: %v", err)
+	}
+	if err := st.DiscardResult(referer.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveText(strings.Repeat("b", 20000)); err != nil {
+		t.Fatalf("write after the referer died: %v", err)
+	}
+	if _, err := st.LoadMeta(frag.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("fragment after referer death: err = %v, want evicted (ErrNotFound)", err)
+	}
+}
+
+func TestTruncateCrashSafety(t *testing.T) {
+	// Each truncate writes a uniquely named segment: a crash
+	// between the segment write and the meta save can then
+	// only orphan the new file — the meta keeps pointing at
+	// the intact previous segment. (With the old fixed name,
+	// the same crash corrupted the result: meta claiming the
+	// old record count over new, shorter content.)
+	st, err := New(t.TempDir(), time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := []json.RawMessage{
+		json.RawMessage(`{"n":1}`),
+		json.RawMessage(`{"n":2}`),
+		json.RawMessage(`{"n":3}`),
+	}
+	m, err := st.SaveRecords(recs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.TruncateRecords(m.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	meta1, err := st.LoadMeta(m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta1.Segments) != 1 || !strings.HasPrefix(meta1.Segments[0].File, "seg-trunc-") {
+		t.Fatalf("segments after first truncate: %+v, want one seg-trunc-* segment", meta1.Segments)
+	}
+	// A second truncate gets a DIFFERENT segment name.
+	if err := st.TruncateRecords(m.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	meta2, err := st.LoadMeta(m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta2.Segments) != 1 || meta2.Segments[0].File == meta1.Segments[0].File {
+		t.Fatalf("second truncate reused the segment name: %+v vs %+v", meta2.Segments, meta1.Segments)
+	}
+	_, page, err := st.RecordsPage(m.ID, 0, 10, 0)
+	if err != nil || len(page.Records) != 1 {
+		t.Fatalf("after two truncates: records=%d err=%v, want the 1 surviving record", len(page.Records), err)
+	}
+	// Simulate the crash state: an uncommitted seg-trunc-*
+	// file exists while the meta points elsewhere. Reads are
+	// unaffected, and the next truncate sweeps the orphan.
+	orphan := filepath.Join(st.Dir(), "results", m.ID, "seg-trunc-crashsim.jsonl")
+	if err := os.WriteFile(orphan, []byte("{\"n\":99}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RecordsPage(m.ID, 0, 10, 0); err != nil {
+		t.Fatalf("RecordsPage with a crash orphan present: %v", err)
+	}
+	if err := st.TruncateRecords(m.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("crash orphan was not swept by the next truncate: %v", err)
+	}
+}

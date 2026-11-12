@@ -46,8 +46,13 @@ func (a *App) getExiftoolInfo(ctx context.Context, _ *mcp.CallToolRequest, in Ex
 	}
 	version, err := runner.Version(ctx, a.Runner)
 	if err != nil {
+		// Classify the failure like every other tool: a
+		// missing binary is EXIFTOOL_NOT_FOUND, but a timeout
+		// is TIMEOUT and a cancellation is CANCELLED — coding
+		// every version failure as NOT_FOUND misleads agents
+		// into reinstall advice for a slow machine.
 		out.Status = "unavailable"
-		out.Errors = append(out.Errors, ToolError{Code: "EXIFTOOL_NOT_FOUND", Message: err.Error()})
+		out.Errors = append(out.Errors, ToolError{Code: errorCode(err), Message: err.Error()})
 		return errResult(), out, nil
 	}
 	out.Version = version
