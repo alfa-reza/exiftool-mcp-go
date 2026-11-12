@@ -365,19 +365,23 @@ func parseDateTime(s string) (parsedDate, bool) {
 // have an exact rational form the comparison is exact, and float64
 // is only the fallback for values without one.
 func cmpNumeric(a, b any) (int, bool) {
-	if _, ok := toNumber(a); !ok {
+	// The exact form is tried FIRST, as documented above: the
+	// float64 gate used to run before it, and toNumber rejects
+	// values whose float64 overflows (1e400 becomes +Inf), so
+	// 1e400 > 1e399 degraded to indeterminate even though both
+	// literals have exact rational forms. Values with no exact
+	// form and no finite float64 (NaN, Inf, non-numeric) fail
+	// both paths and stay indeterminate.
+	if ra, okA := exactRat(a); okA {
+		if rb, okB := exactRat(b); okB {
+			return ra.Cmp(rb), true
+		}
+	}
+	fa, okA := toNumber(a)
+	fb, okB := toNumber(b)
+	if !okA || !okB {
 		return 0, false
 	}
-	if _, ok := toNumber(b); !ok {
-		return 0, false
-	}
-	ra, okA := exactRat(a)
-	rb, okB := exactRat(b)
-	if okA && okB {
-		return ra.Cmp(rb), true
-	}
-	fa, _ := toNumber(a)
-	fb, _ := toNumber(b)
 	switch {
 	case fa < fb:
 		return -1, true

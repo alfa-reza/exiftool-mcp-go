@@ -98,14 +98,17 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 		}
 		out = append(out, FileResultFromPairs(f, obj))
 	}
-	applyStderrDiagnostics(out, files, res.Stderr)
-	if res.ExitCode != 0 && !explainedByDiagnostics(out) {
-		// ExifTool reported failure, but nothing in its output
-		// explains which file failed or why: the surviving
-		// entries cannot be trusted as complete reads (a
-		// "missing" verdict over them could be fabricated), so
-		// the read fails as a whole. Explained partial failures
-		// keep their per-file results above.
+	unmatched := applyStderrDiagnostics(out, files, res.Stderr)
+	if res.ExitCode != 0 && (unmatched > 0 || !explainedByDiagnostics(out)) {
+		// ExifTool reported failure, but its diagnostics do
+		// not fully account for it: either no file carries an
+		// error, or stderr holds error lines that name no file
+		// in this batch (a global failure the per-file results
+		// say nothing about). The surviving entries cannot be
+		// trusted as complete reads (a "missing" verdict over
+		// them could be fabricated), so the read fails as a
+		// whole. Explained partial failures keep their
+		// per-file results above.
 		return nil, fmt.Errorf("exiftool exited %d without per-file diagnostics (stderr: %s)",
 			res.ExitCode, truncate(strings.TrimSpace(res.Stderr), 300))
 	}
@@ -113,11 +116,15 @@ func (r *Reader) readChunk(ctx context.Context, files []string, spec ReadSpec) (
 }
 
 // explainedByDiagnostics reports whether any file in the result
-// carries evidence of a failure: an error entry (including a
-// file ExifTool produced no output for) or a correlated warning.
+// carries an actual failure: an error entry (including a file
+// ExifTool produced no output for, or one a correlated stderr
+// error named). A warning never explains a nonzero exit: a
+// warning on one file says nothing about the error the exit
+// code reports, and treating it as an explanation used to let
+// a global ExifTool error pass silently.
 func explainedByDiagnostics(out []FileResult) bool {
 	for _, fr := range out {
-		if fr.Status == "error" || len(fr.Warnings) > 0 {
+		if fr.Status == "error" {
 			return true
 		}
 	}
@@ -134,16 +141,20 @@ func pathKey(p string) string {
 	return strings.ReplaceAll(p, "\\", "/")
 }
 
-// applyStderrDiagnostics correlates stderr diagnostics with files.
+// applyStderrDiagnostics correlates stderr diagnostics with files
+// and returns the number of stderr error lines that could not be
+// correlated with any file in the batch: those describe a failure
+// outside the per-file results.
 //
 // When tags are selected, ExifTool omits the Error field from the JSON
 // object of a failed file and reports "Error: <msg> - <operand>" on
 // stderr instead (verified against ExifTool 13.55). The operand is
 // echoed after the last " - " separator; it is matched exactly or in
 // normalized slash form (Windows echo style), never by guessing.
-func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
+func applyStderrDiagnostics(out []FileResult, files []string, stderr string) int {
+	unmatched := 0
 	if stderr == "" {
-		return
+		return 0
 	}
 	type diag struct{ errors, warnings []string }
 	byOperand := make(map[string]*diag)
@@ -184,6 +195,12 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 			}
 		}
 		if best < 0 {
+			// A diagnostic naming no file in this batch. An
+			// error here is a failure the per-file results
+			// cannot account for; it must not be dropped.
+			if kind == "error" {
+				unmatched++
+			}
 			continue
 		}
 		msg := rest[:len(rest)-bestLen]
@@ -221,6 +238,7 @@ func applyStderrDiagnostics(out []FileResult, files []string, stderr string) {
 			}
 		}
 	}
+	return unmatched
 }
 
 // Pair is one raw key/value pair of an ExifTool JSON object, in order,

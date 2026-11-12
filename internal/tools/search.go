@@ -177,16 +177,19 @@ func (a *App) searchMetadata(ctx context.Context, req *mcp.CallToolRequest, in S
 	if err := guardFastLevel(spec); err != nil {
 		return fail("INVALID_ARGUMENT", err.Error())
 	}
-	// Enumeration is part of the call's work: when the caller set
-	// max_seconds, the enumeration of a huge tree is bounded by
-	// it too, instead of running before the batch clock starts.
-	enumCtx := ctx
+	// One max_seconds budget bounds the WHOLE call: the timeout
+	// context minted here is shared by enumeration and by the
+	// batch (runSearchBatch caps its clock at whatever this
+	// deadline leaves). Giving each phase its own fresh budget
+	// let a call run for nearly twice max_seconds when
+	// enumeration consumed most of its share first.
+	callCtx := ctx
 	if in.ScanOptions != nil && in.ScanOptions.MaxSeconds > 0 {
 		var cancel context.CancelFunc
-		enumCtx, cancel = context.WithTimeout(ctx, time.Duration(min(in.ScanOptions.MaxSeconds, 3600))*time.Second)
+		callCtx, cancel = context.WithTimeout(ctx, time.Duration(min(in.ScanOptions.MaxSeconds, 3600))*time.Second)
 		defer cancel()
 	}
-	candidates, enumErrs, err := meta.Enumerate(enumCtx, in.Paths, in.Recursive, in.Extensions)
+	candidates, enumErrs, err := meta.Enumerate(callCtx, in.Paths, in.Recursive, in.Extensions)
 	if err != nil {
 		return fail(errorCode(err), "enumerating candidates: "+err.Error())
 	}
@@ -219,7 +222,7 @@ func (a *App) searchMetadata(ctx context.Context, req *mcp.CallToolRequest, in S
 		return fail(storeErrorCode(err), err.Error())
 	}
 	out.EffectiveOptions = spec.Describe()
-	return a.runSearchBatch(ctx, in, job, prepared, spec, out)
+	return a.runSearchBatch(callCtx, in, job, prepared, spec, out)
 }
 
 func (a *App) resumeSearch(ctx context.Context, in SearchMetadataIn) (*mcp.CallToolResult, SearchMetadataOut, error) {
@@ -377,6 +380,16 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 			batchTime = time.Duration(min(in.ScanOptions.MaxSeconds, 3600)) * time.Second
 		}
 	}
+	// A deadline the context already carries caps the batch
+	// clock: on a fresh scan that is the call's single shared
+	// max_seconds budget (enumeration already spent part of
+	// it), so the batch gets what is left, not a fresh budget.
+	// Resume calls carry no such deadline and are unaffected.
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem < batchTime {
+			batchTime = rem
+		}
+	}
 	remaining := len(job.Candidates) - job.NextIndex
 	if remaining <= 0 {
 		// Already fully scanned (e.g. a repeated resume of a
@@ -387,6 +400,11 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 		budget = remaining
 	}
 	var callRecords []ScanRecord
+	// batchRefs accumulates the pending fragments this batch
+	// creates, as accounting externalizes values. Until the
+	// batch commits, a failure discards them (see the commit
+	// block); after it, finalizeValueRefs completes them.
+	var batchRefs []string
 	if budget > 0 {
 		// ONE work deadline bounds the whole invocation: the batch
 		// attempt and the per-file fallback both live under it, so
@@ -468,7 +486,13 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 				job.Matched++
 				vals, verr := a.externalizeValues(filterEntries(fr.Entries, job.ReturnTags))
 				if verr != nil {
+					a.discardRefs(batchRefs)
 					return fail(storeErrorCode(verr), verr.Error())
+				}
+				for _, e := range vals {
+					if e.ValueRef != nil {
+						batchRefs = append(batchRefs, e.ValueRef.ResultID)
+					}
 				}
 				callRecords = append(callRecords, ScanRecord{
 					Path: fr.Path, Status: "match",
@@ -480,7 +504,13 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 				job.Indet++
 				vals, verr := a.externalizeValues(filterEntries(fr.Entries, job.ReturnTags))
 				if verr != nil {
+					a.discardRefs(batchRefs)
 					return fail(storeErrorCode(verr), verr.Error())
+				}
+				for _, e := range vals {
+					if e.ValueRef != nil {
+						batchRefs = append(batchRefs, e.ValueRef.ResultID)
+					}
 				}
 				callRecords = append(callRecords, ScanRecord{
 					Path: fr.Path, Status: "indeterminate", Reason: reason,
@@ -497,9 +527,11 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	if len(callRecords) > 0 {
 		records, err := marshalRecords(callRecords)
 		if err != nil {
+			a.discardRefs(batchRefs)
 			return fail("EXTRACTION_FAILED", err.Error())
 		}
 		if _, err := a.Store.AppendRecords(job.ResultID, records); err != nil {
+			a.discardRefs(batchRefs)
 			return fail(storeErrorCode(err), err.Error())
 		}
 		job.CommittedRecords += len(callRecords)
@@ -513,15 +545,9 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 	// were created pending (incomplete), which cleanup never
 	// evicts, so neither the externalization writes nor the
 	// commit above could remove them. They become ordinary
-	// results only here, after verification.
-	var batchRefs []string
-	for _, rec := range callRecords {
-		for _, e := range rec.Values {
-			if e.ValueRef != nil {
-				batchRefs = append(batchRefs, e.ValueRef.ResultID)
-			}
-		}
-	}
+	// results only here, after verification. (A failure from
+	// here on does NOT discard them: the records referencing
+	// them are committed.)
 	if err := a.finalizeValueRefs(batchRefs); err != nil {
 		return fail(storeErrorCode(err), err.Error())
 	}
@@ -530,7 +556,18 @@ func (a *App) runSearchBatch(ctx context.Context, in SearchMetadataIn, job *stor
 			return fail(storeErrorCode(err), err.Error())
 		}
 	}
-	pageN, _, err := pageByBudget(callRecords, a.Cfg.DefaultPageSize, a.Cfg.MaxResponseBytes)
+	pageN, marshaled, err := pageByBudget(callRecords, a.Cfg.DefaultPageSize, a.Cfg.MaxResponseBytes)
+	if err == nil && len(marshaled) > 0 && a.Cfg.MaxResponseBytes > 0 && len(marshaled[0]) > a.Cfg.MaxResponseBytes {
+		// The first record alone exceeds the response byte
+		// budget: pageByBudget's at-least-one rule must not
+		// apply here — returning the record whole would break
+		// the limit the configuration promises. The record is
+		// committed in the scan's stored result, so the page
+		// is empty instead and the cursor below points at it;
+		// get_result_page retrieves it under a byte limit the
+		// agent controls.
+		pageN = 0
+	}
 	if err == nil && pageN < len(callRecords) {
 		// The response carries only the first page of this
 		// batch's records; the rest are in the scan's stored

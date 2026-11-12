@@ -433,6 +433,19 @@ func (s *Store) TruncateRecords(id string, keep int) error {
 		lines = append(lines, segLines[:take]...)
 		remaining -= take
 	}
+	// Remove orphans of earlier truncates that crashed before
+	// their saveMeta: unreferenced seg-trunc-* segments.
+	referenced := make(map[string]bool, len(m.Segments))
+	for _, seg := range m.Segments {
+		referenced[seg.File] = true
+	}
+	if olds, _ := filepath.Glob(filepath.Join(s.resultDir(id), "seg-trunc-*.jsonl")); olds != nil {
+		for _, f := range olds {
+			if !referenced[filepath.Base(f)] {
+				_ = os.Remove(f)
+			}
+		}
+	}
 	old := m.Segments
 	m.Segments = nil
 	m.TotalBytes = 0
@@ -442,7 +455,16 @@ func (s *Store) TruncateRecords(id string, keep int) error {
 			buf.WriteString(line)
 			buf.WriteByte('\n')
 		}
-		name := "seg-trunc.jsonl"
+		// A unique name per truncate: with a fixed name, a
+		// crash between replacing the segment and saving the
+		// meta on a SECOND truncate left the meta claiming
+		// the old record count over the new, shorter content
+		// — a corrupt result. With a unique name the meta
+		// still points at the intact previous segment until
+		// saveMeta commits the new one; the uncommitted file
+		// is an orphan, swept by a later truncate (above) or
+		// removed with the result itself.
+		name := "seg-trunc-" + newID() + ".jsonl"
 		if err := writeAtomic(filepath.Join(s.resultDir(id), name), buf.Bytes()); err != nil {
 			return err
 		}
@@ -459,6 +481,27 @@ func (s *Store) TruncateRecords(id string, keep int) error {
 		}
 	}
 	return nil
+}
+
+// DiscardResult removes a result outright, ignoring absence.
+// It exists for the pending-fragment lifecycle: a tool whose
+// call fails after creating pending fragments discards them,
+// because incomplete results are never evicted and would
+// otherwise occupy quota until their TTL, degrading a retry
+// of the same call to RESULT_STORE_FULL. Callers must only
+// discard results no committed record references.
+func (s *Store) DiscardResult(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if !validID(id) {
+		return fmt.Errorf("%w: invalid result id", ErrNotFound)
+	}
+	return os.RemoveAll(s.resultDir(id))
 }
 
 // MarkComplete flags a result as fully written.
@@ -983,11 +1026,7 @@ func (s *Store) Cleanup() (int, error) {
 func (s *Store) cleanup(need int64) (int, error) {
 	removed := 0
 	now := s.now()
-	type aged struct {
-		id      string
-		created time.Time
-		size    int64
-	}
+
 	var results []aged
 	entries, _ := os.ReadDir(filepath.Join(s.dir, "results"))
 	for _, e := range entries {
@@ -1021,7 +1060,7 @@ func (s *Store) cleanup(need int64) (int, error) {
 			return nil
 		})
 		if m.Complete {
-			results = append(results, aged{id: e.Name(), created: m.CreatedAt, size: sz})
+			results = append(results, aged{id: e.Name(), created: m.CreatedAt, size: sz, kind: m.Kind})
 		}
 	}
 	scans, _ := os.ReadDir(filepath.Join(s.dir, "scans"))
@@ -1048,12 +1087,21 @@ func (s *Store) cleanup(need int64) (int, error) {
 	if s.quota > 0 {
 		total := s.TotalBytes()
 		if total+need > s.quota {
+			// Retention contract: a fragment referenced by a
+			// surviving records result is pinned and skipped
+			// here (see referencedFragments). If the remaining
+			// candidates cannot make room, ensureCapacity
+			// reports ErrFull to the caller.
+			pinned := s.referencedFragments(results)
 			sort.Slice(results, func(i, j int) bool {
 				return results[i].created.Before(results[j].created)
 			})
 			for _, r := range results {
 				if total+need <= s.quota {
 					break
+				}
+				if pinned[r.id] {
+					continue
 				}
 				_ = os.RemoveAll(s.resultDir(r.id))
 				total -= r.size
@@ -1062,6 +1110,65 @@ func (s *Store) cleanup(need int64) (int, error) {
 		}
 	}
 	return removed, nil
+}
+
+// aged is one eviction candidate: a complete result cleanup
+// may remove under quota pressure.
+type aged struct {
+	id      string
+	created time.Time
+	size    int64
+	kind    Kind
+}
+
+// referencedFragments returns the subset of the given eviction
+// candidates that must be retained: value fragments (text or
+// binary results) whose ID appears in a surviving records
+// result. The retention contract is that a value_ref stays
+// valid exactly as long as the result that cites it: quota
+// eviction may remove unreferenced results at any time, but
+// never a fragment out from under a live records result. When
+// the citing result is itself evicted or expires, the fragment
+// becomes an ordinary candidate in a later pass.
+//
+// The scan is a substring search over the records' segment
+// bytes: fragment IDs are random 128-bit values stored in the
+// records' value_ref objects, so a plain byte match is exact
+// for practical purposes. It runs only on the eviction path,
+// under quota pressure.
+func (s *Store) referencedFragments(candidates []aged) map[string]bool {
+	pinned := map[string]bool{}
+	var fragIDs []string
+	for _, c := range candidates {
+		if c.kind == KindText || c.kind == KindBinary {
+			fragIDs = append(fragIDs, c.id)
+		}
+	}
+	if len(fragIDs) == 0 {
+		return pinned
+	}
+	entries, _ := os.ReadDir(filepath.Join(s.dir, "results"))
+	for _, e := range entries {
+		if !e.IsDir() || !validID(e.Name()) {
+			continue
+		}
+		m, err := s.LoadMetaIgnoringExpiry(e.Name())
+		if err != nil || m.Kind != KindRecords {
+			continue
+		}
+		for _, seg := range m.Segments {
+			data, err := os.ReadFile(filepath.Join(s.resultDir(e.Name()), seg.File))
+			if err != nil {
+				continue
+			}
+			for _, id := range fragIDs {
+				if !pinned[id] && bytes.Contains(data, []byte(id)) {
+					pinned[id] = true
+				}
+			}
+		}
+	}
+	return pinned
 }
 
 // TotalBytes reports the current disk usage of the whole store:

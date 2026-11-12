@@ -84,6 +84,16 @@ func (a *App) finalizeValueRefs(ids []string) error {
 	return nil
 }
 
+// discardRefs removes pending fragments a failed call created
+// and never committed references to. Errors are ignored on
+// purpose: the call is already failing, and a fragment that
+// cannot be removed is still bounded by its TTL.
+func (a *App) discardRefs(ids []string) {
+	for _, id := range ids {
+		_ = a.Store.DiscardResult(id)
+	}
+}
+
 func (a *App) externalizeEntryValue(e *meta.Entry) (bool, error) {
 	raw, err := json.Marshal(e.Value)
 	if err != nil || len(raw) <= largeValueThreshold {
@@ -151,8 +161,19 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 	pageBytes := 0
 	var stored *store.ResultMeta
 	var madeRefs []string
+	finalized := false
 	processed, errorCount := 0, 0
 	failWith := func(code, msg string) (*mcp.CallToolResult, ReadMetadataOut, error) {
+		// A failed call discards the pending fragments it
+		// created: nothing the agent can reach references
+		// them (this call's stored result is completed only
+		// on the success path), and as incomplete results
+		// they would otherwise occupy quota until their TTL.
+		// After finalization the fragments are complete and
+		// referenced by committed records, so they stay.
+		if !finalized {
+			a.discardRefs(madeRefs)
+		}
 		out.Status = "failed"
 		out.Errors = append(out.Errors, ToolError{Code: code, Message: msg})
 		return errResult(), out, nil
@@ -235,6 +256,7 @@ func (a *App) readMetadata(ctx context.Context, _ *mcp.CallToolRequest, in ReadM
 	if err := a.finalizeValueRefs(madeRefs); err != nil {
 		return failWith(storeErrorCode(err), err.Error())
 	}
+	finalized = true
 	out.ProcessedCount = processed
 	if processed == 0 || (errorCount == processed && processed > 0) {
 		if len(enumErrs) > 0 || errorCount > 0 {
